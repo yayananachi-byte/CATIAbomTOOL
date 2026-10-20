@@ -3,6 +3,10 @@
 依赖：openpyxl、Pillow（均随 Codex 运行环境提供）。
 
 示例：
+    # 不带参数运行：依次选择 BOM、模板和输出文件
+    python bom_to_control_table.py
+
+    # 命令行指定文件：适合批量处理
     python bom_to_control_table.py \
       --bom CATIA_图片清单_STU-0000509373_03_20260901_135340.xlsx \
       --template 客户XXX-项目名XXX-基础数据管制表-日期.xlsx
@@ -19,19 +23,51 @@ import sys
 from copy import copy
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional, Sequence
 
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.formula.translate import Translator
-from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.cell_range import CellRange
 
 
 DATA_START_ROW = 10
 ROWS_PER_RECORD = 6
 PRODUCT_LAST_COL = 40  # AN
+HIERARCHY_COLUMNS = ("D", "E", "F", "G", "H", "I", "J")
+
+# 汽车常见标准件。名称命中这些词（中英文均可）或零件号以 Q/X 开头时，
+# 将重量填写到“标准件净重/kg”(W)，否则填写到“产品净重/kg”(X)。
+STANDARD_PART_KEYWORDS = (
+    "标准件", "螺栓", "螺母", "螺钉", "螺丝", "垫圈", "垫片", "铆钉",
+    "销", "卡扣", "夹子", "弹簧", "轴承", "紧固件", "焊钉", "螺柱",
+    "bolt", "nut", "screw", "washer", "rivet", "pin", "clip", "clamp",
+    "fastener", "stud", "bearing", "spring", "snap", "cotter",
+)
+
+
+class ConversionCancelled(RuntimeError):
+    """用户在安全写入边界请求取消模板转换。"""
+
+
+def _check_conversion_cancel(cancel_requested: Optional[Callable[[], bool]]) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise ConversionCancelled("已收到取消请求，尚未生成输出文件。")
+
+
+def _emit_progress(
+    progress_callback: Optional[Callable[[int, str], None]],
+    percent: int,
+    message: str,
+) -> None:
+    """向 GUI 报告进度；界面更新失败不影响转换。"""
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(max(0, min(100, int(percent))), message)
+    except Exception:
+        pass
 
 
 def clean_text(value: Any) -> str | None:
@@ -50,10 +86,12 @@ def trim_part_name(value: Any) -> str | None:
 
 def extract_thickness(value: Any) -> float | None:
     """从“0.700 mm”一类文本中取出厚度；未识别时留空。"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
     text = clean_text(value)
     if not text:
         return None
-    match = re.search(r"(?<![A-Za-z])(-?\d+(?:\.\d+)?)\s*mm\b", text, flags=re.I)
+    match = re.search(r"(?<![A-Za-z])(-?\d+(?:\.\d+)?)\s*(?:mm)?\b", text, flags=re.I)
     return float(match.group(1)) if match else None
 
 
@@ -62,6 +100,18 @@ def get_value(record: dict[str, Any], header: str) -> Any:
     if isinstance(value, str):
         return clean_text(value)
     return value
+
+
+def as_number(value: Any) -> float | None:
+    """安全转换数值；用于质量字段统一保留两位小数。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def read_bom(bom_path: Path) -> tuple[list[dict[str, Any]], dict[int, ExcelImage]]:
@@ -78,6 +128,20 @@ def read_bom(bom_path: Path) -> tuple[list[dict[str, Any]], dict[int, ExcelImage
     missing = required_headers - set(headers)
     if missing:
         raise ValueError(f"BOM 缺少必需列：{'、'.join(sorted(missing))}")
+
+    # 旧版简版 CATIA_BOM 只带结构、图片和 XYZ，无法可靠填写基础信息。
+    # 请用更新后的 catia_bom_export_v2.py 或 catia_bom_screenshot.py 重新导出。
+    physical_headers = {
+        "单件质量(kg)", "包装包络长(mm)", "包装包络宽(mm)", "包装包络高(mm)",
+        "名义厚度", "本级数量",
+    }
+    missing_physical = physical_headers - set(headers)
+    if missing_physical:
+        raise ValueError(
+            "所选文件是简版 CATIA_BOM，缺少基础信息列："
+            f"{'、'.join(sorted(missing_physical))}。请先运行更新后的 catia_bom_export_v2.py "
+            "或 catia_bom_screenshot.py 重新导出，再选择新生成的 Excel。"
+        )
 
     records: list[dict[str, Any]] = []
     for row_index in range(3, sheet.max_row + 1):
@@ -215,71 +279,49 @@ def clear_product_area(sheet, slot_starts: list[int]) -> None:
                     cell.value = None
 
 
-def root_and_parent_maps(
-    records: list[dict[str, Any]]
-) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    by_tree = {record["_tree_no"]: record for record in records}
-    roots: dict[str, dict[str, Any]] = {}
-    for record in records:
-        root_key = record["_path"][0]
-        roots.setdefault(root_key, record)
-    return by_tree, roots
-
-
-def nearest_subassembly_number(record: dict[str, Any], by_tree: dict[str, dict[str, Any]]) -> str | None:
-    """返回当前记录所属的最近分总成号；直属于根总成的零件返回空。"""
-    path = record["_path"]
-    for length in range(len(path), 1, -1):
-        candidate = by_tree.get(".".join(path[:length]))
-        if candidate and clean_text(candidate.get("类型")) == "子总成":
-            return clean_text(candidate.get("零件号"))
-    return None
-
-
-def as_number(value: Any) -> float | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
-def aggregate_masses(records: list[dict[str, Any]]) -> dict[str, float | None]:
-    """获取每个节点的本级总质量；总成/分总成无质量时递归汇总直属下级。"""
-    children: dict[str, list[dict[str, Any]]] = {}
-    for record in records:
-        parent = ".".join(record["_path"][:-1])
-        if parent:
-            children.setdefault(parent, []).append(record)
-
-    masses: dict[str, float | None] = {}
-    for record in sorted(records, key=lambda item: len(item["_path"]), reverse=True):
-        tree_no = record["_tree_no"]
-        reported = as_number(get_value(record, "本级总质量(kg)"))
-        if reported is not None:
-            masses[tree_no] = reported
-            continue
-        child_masses = [
-            masses.get(child["_tree_no"])
-            for child in children.get(tree_no, [])
-        ]
-        numeric_child_masses = [mass for mass in child_masses if mass is not None]
-        masses[tree_no] = sum(numeric_child_masses) if numeric_child_masses else None
-    return masses
-
-
 def is_standard_part(record: dict[str, Any]) -> bool:
-    """CATIA BOM 中 Q/X 开头的零件号通常为紧固件等标准件。"""
+    """按照零件名称和常见标准件号规则识别汽车标准件。"""
     part_no = clean_text(record.get("零件号")) or ""
-    return bool(re.match(r"^[QX]\d", part_no, flags=re.I))
+    name = (clean_text(record.get("零件名称")) or "").casefold()
+    return bool(re.match(r"^[QX]\d", part_no, flags=re.I)) or any(
+        keyword.casefold() in name for keyword in STANDARD_PART_KEYWORDS
+    )
+
+
+def is_root_assembly(record: dict[str, Any]) -> bool:
+    return clean_text(record.get("类型")) == "根产品"
+
+
+def is_subassembly(record: dict[str, Any]) -> bool:
+    return clean_text(record.get("类型")) == "子总成"
+
+
+def is_part(record: dict[str, Any]) -> bool:
+    return clean_text(record.get("类型")) == "零件"
+
+
+def descendant_last_index(records: list[dict[str, Any]], index: int) -> int:
+    """返回当前节点子树的最后一条记录（BOM 保持深度优先顺序）。"""
+    path = records[index]["_path"]
+    for candidate in range(index + 1, len(records)):
+        if records[candidate]["_path"][: len(path)] != path:
+            return candidate - 1
+    return len(records) - 1
 
 
 def set_value(sheet, row: int, column: str, value: Any) -> None:
     if value is not None and value != "":
         sheet[f"{column}{row}"].value = value
+
+
+def set_mass_value(sheet, row: int, column: str, value: Any) -> None:
+    """写入 kg 质量，并统一以两位小数显示。"""
+    mass = as_number(value)
+    if mass is None:
+        return
+    cell = sheet[f"{column}{row}"]
+    cell.value = round(mass, 2)
+    cell.number_format = "0.00"
 
 
 def copy_thumbnail(sheet, source_image: ExcelImage | None, target_cell: str) -> None:
@@ -295,11 +337,7 @@ def copy_thumbnail(sheet, source_image: ExcelImage | None, target_cell: str) -> 
 def write_record(
     sheet,
     target_row: int,
-    serial_number: int,
     record: dict[str, Any],
-    by_tree: dict[str, dict[str, Any]],
-    roots: dict[str, dict[str, Any]],
-    masses: dict[str, float | None],
     source_image: ExcelImage | None,
 ) -> None:
     path = record["_path"]
@@ -309,46 +347,81 @@ def write_record(
             f"树编号 {record['_tree_no']} 的层级为 {depth}，超过模板支持的 6 层（E:J）。"
         )
 
-    part_type = clean_text(record.get("类型"))
     part_no = clean_text(record.get("零件号"))
     material = clean_text(record.get("PartBody Material")) or clean_text(record.get("属性 Material"))
     thickness = extract_thickness(record.get("名义厚度"))
     piece_mass = get_value(record, "单件质量(kg)")
-    current_total_mass = get_value(record, "本级总质量(kg)")
-    root_record = roots[path[0]]
-    root_mass = masses.get(root_record["_tree_no"])
 
-    # D 是序号；E:J 分别对应 BOM 的第 1 至第 6 层。根产品由其序号表示。
-    set_value(sheet, target_row, "D", serial_number)
-    if depth > 0:
-        hierarchy_column = get_column_letter(4 + depth)
-        set_value(sheet, target_row, hierarchy_column, record["_tree_no"])
+    # 每条记录只写入所属的那一级：根总成在 D，一级子项在 E，二级子项在 F，依此类推。
+    # 例如 1 / 1.1 / 1.1.1 分别写在 D / E / F，不在同一行重复祖先层级。
+    set_value(sheet, target_row, HIERARCHY_COLUMNS[depth], record["_tree_no"])
 
-    # 仅写入用户指定的产品字段。
-    set_value(sheet, target_row, "M", clean_text(root_record.get("零件号")))
-    set_value(sheet, target_row, "N", nearest_subassembly_number(record, by_tree))
-    set_value(sheet, target_row, "O", part_no)
+    # 总成、分总成、零件号三列互斥，避免在同一条记录重复填写编号。
+    if is_root_assembly(record):
+        set_value(sheet, target_row, "M", part_no)
+    elif is_subassembly(record):
+        set_value(sheet, target_row, "N", part_no)
+    elif is_part(record):
+        set_value(sheet, target_row, "O", part_no)
+
     set_value(sheet, target_row, "Q", trim_part_name(record.get("零件名称")))
-    set_value(sheet, target_row, "R", get_value(record, "本级数量"))
-
-    # 质量字段遵循模板语义：总成仅写 U，子总成写 V，零件写 X。
-    if depth == 0:
-        set_value(sheet, target_row, "U", root_mass)
-    if part_type == "子总成":
-        set_value(sheet, target_row, "V", masses.get(record["_tree_no"]))
-    if part_type == "零件":
+    if is_part(record):
+        # 完整图片清单中的“本级数量”就是零件单耗；缺失时按 1 件处理。
+        set_value(sheet, target_row, "R", get_value(record, "本级数量") or 1)
         if is_standard_part(record):
-            set_value(sheet, target_row, "W", piece_mass)
+            set_mass_value(sheet, target_row, "W", piece_mass)
         else:
-            set_value(sheet, target_row, "X", piece_mass)
+            set_mass_value(sheet, target_row, "X", piece_mass)
 
-    set_value(sheet, target_row, "Y", material)
-    set_value(sheet, target_row, "Z", thickness)
-    set_value(sheet, target_row, "AB", get_value(record, "包装包络长(mm)"))
-    set_value(sheet, target_row, "AC", get_value(record, "包装包络宽(mm)"))
-    set_value(sheet, target_row, "AD", get_value(record, "包装包络高(mm)"))
+        set_value(sheet, target_row, "Y", material)
+        set_value(sheet, target_row, "Z", thickness)
+        set_value(sheet, target_row, "AB", get_value(record, "包装包络长(mm)"))
+        set_value(sheet, target_row, "AC", get_value(record, "包装包络宽(mm)"))
+        set_value(sheet, target_row, "AD", get_value(record, "包装包络高(mm)"))
     set_value(sheet, target_row, "AL", clean_text(record.get("版本")))
     copy_thumbnail(sheet, source_image, f"AN{target_row}")
+
+
+def write_assembly_mass_formulas(
+    sheet, records: list[dict[str, Any]], target_slots: list[int]
+) -> None:
+    """用 Excel 公式统计总成和分总成的净重。
+
+    W、X 是每件标准件/产品净重，R 是单耗。公式只逐项引用实际零件所在的
+    记录行，不引用合并单元格内的空白行；因此不会多算，也不会重复计算分总成。
+    """
+    for index, record in enumerate(records):
+        if not (is_root_assembly(record) or is_subassembly(record)):
+            continue
+        last_index = descendant_last_index(records, index)
+        target_row = target_slots[index]
+        terms: list[str] = []
+        for descendant_index in range(index + 1, last_index + 1):
+            descendant = records[descendant_index]
+            if not is_part(descendant):
+                continue
+            mass_column = "W" if is_standard_part(descendant) else "X"
+            part_row = target_slots[descendant_index]
+            terms.append(f"SUMPRODUCT($R${part_row},${mass_column}${part_row})")
+        formula = f"=ROUND({'+'.join(terms)},2)" if terms else "=0"
+        target_cell = sheet[f"{'U' if is_root_assembly(record) else 'V'}{target_row}"]
+        target_cell.value = formula
+        target_cell.number_format = "0.00"
+
+
+def write_summary_formulas(
+    sheet, summary_start: int, records: list[dict[str, Any]], target_slots: list[int]
+) -> None:
+    """填写汇总区的总成开发数与总成净重。"""
+    if not target_slots:
+        return
+    last_row = target_slots[-1]
+    # 每条记录块的 D 单元格纵向合并，不能用 Excel 直接计数；由 BOM 根节点数准确填写。
+    sheet[f"L{summary_start}"] = sum(1 for record in records if is_root_assembly(record))
+    # U 仅在根总成行有公式，因此可直接求和，适用于一个或多个根总成。
+    summary_mass = sheet[f"Q{summary_start}"]
+    summary_mass.value = f"=ROUND(SUM($U$10:$U${last_row}),2)"
+    summary_mass.number_format = "0.00"
 
 
 def update_summary_formula_ranges(sheet, summary_start: int) -> None:
@@ -379,41 +452,199 @@ def shift_summary_references(
                 cell.value = cell_ref.sub(replace_reference, cell.value)
 
 
-def convert(bom_path: Path, template_path: Path, output_path: Path) -> None:
-    records, images_by_row = read_bom(bom_path)
-    template_book = openpyxl.load_workbook(template_path)
+def rebase_root_numbers(
+    records: list[dict[str, Any]], next_root_number: int
+) -> tuple[list[dict[str, Any]], int]:
+    """为合并后的 BOM 重新编号根节点，保持每棵树相互独立。
+
+    单个 CATIA BOM 通常都从 ``1`` 开始。如果直接把多份 BOM 拼接，第一份
+    BOM 的根 ``1`` 会把后续 BOM 的根 ``1`` 当成自己的后代，进而导致总成
+    重量公式错误。这里只替换路径的第一级编号，子级编号与原 BOM 保持不变。
+    """
+    root_number_map: dict[str, str] = {}
+    rebased_records: list[dict[str, Any]] = []
+
+    for record in records:
+        original_path = list(record["_path"])
+        if not original_path:
+            raise ValueError("BOM 中存在空的树编号，无法合并。")
+        original_root = original_path[0]
+        if original_root not in root_number_map:
+            root_number_map[original_root] = str(next_root_number)
+            next_root_number += 1
+        rebased_path = [root_number_map[original_root], *original_path[1:]]
+        rebased = dict(record)
+        rebased_tree_no = ".".join(rebased_path)
+        rebased["_path"] = rebased_path
+        rebased["_tree_no"] = rebased_tree_no
+        # 写入产品区时会用到“树编号”字段，需与内部路径保持一致。
+        rebased["树编号"] = rebased_tree_no
+        rebased_records.append(rebased)
+
+    return rebased_records, next_root_number
+
+
+def read_and_merge_boms(
+    bom_paths: Sequence[Path],
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+) -> list[dict[str, Any]]:
+    """读取多份 CATIA 图片清单并合并成一棵安全的记录序列。"""
+    if not bom_paths:
+        raise ValueError("请至少选择一份 CATIA BOM 图片清单。")
+
+    combined_records: list[dict[str, Any]] = []
+    next_root_number = 1
+    total = len(bom_paths)
+    for index, bom_path in enumerate(bom_paths, 1):
+        _check_conversion_cancel(cancel_requested)
+        _emit_progress(
+            progress_callback,
+            round((index - 1) * 35 / total),
+            f"正在读取 BOM {index}/{total}：{bom_path.name}",
+        )
+        records, images_by_row = read_bom(bom_path)
+        rebased_records, next_root_number = rebase_root_numbers(records, next_root_number)
+        for record in rebased_records:
+            record["_source_image"] = images_by_row.get(record["_source_row"])
+        combined_records.extend(rebased_records)
+
+    if not combined_records:
+        raise ValueError("所选 BOM 中没有可转换的产品结构记录。")
+    return combined_records
+
+
+def convert_many(
+    bom_paths: Sequence[Path],
+    template_path: Path,
+    output_path: Path,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+) -> None:
+    """将一份或多份 CATIA BOM 合并写入同一份基础数据管制表模板。"""
+    normalized_bom_paths = [Path(path).resolve() for path in bom_paths]
+    normalized_template_path = Path(template_path).resolve()
+    normalized_output_path = Path(output_path).resolve()
+    if not normalized_bom_paths:
+        raise ValueError("请至少选择一份 CATIA BOM 图片清单。")
+    missing = [str(path) for path in normalized_bom_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("找不到 BOM 文件：\n" + "\n".join(missing))
+    if not normalized_template_path.is_file():
+        raise FileNotFoundError(f"找不到基础数据管制表模板：{normalized_template_path}")
+    if normalized_output_path in [*normalized_bom_paths, normalized_template_path]:
+        raise ValueError("输出文件不能覆盖 BOM 文件或模板文件。")
+
+    _check_conversion_cancel(cancel_requested)
+    records = read_and_merge_boms(
+        normalized_bom_paths,
+        progress_callback=progress_callback,
+        cancel_requested=cancel_requested,
+    )
+    _check_conversion_cancel(cancel_requested)
+    _emit_progress(progress_callback, 38, "正在读取基础数据管制表模板")
+    template_book = openpyxl.load_workbook(normalized_template_path)
     template_sheet = template_book.active
 
     slot_starts, summary_start = ensure_record_capacity(template_sheet, len(records))
     clear_product_area(template_sheet, slot_starts)
-    by_tree, roots = root_and_parent_maps(records)
-    masses = aggregate_masses(records)
 
-    for serial_number, (record, target_row) in enumerate(
-        zip(records, slot_starts, strict=True), start=1
-    ):
+    if len(slot_starts) < len(records):
+        raise RuntimeError("模板记录槽位不足，无法写入全部 BOM 记录。")
+
+    # 模板会预留空白记录槽位；只使用与 BOM 条目数相同的前 N 个槽位。
+    target_slots = slot_starts[: len(records)]
+
+    for index, (record, target_row) in enumerate(zip(records, target_slots), 1):
+        _check_conversion_cancel(cancel_requested)
         write_record(
             template_sheet,
             target_row,
-            serial_number,
             record,
-            by_tree,
-            roots,
-            masses,
-            images_by_row.get(record["_source_row"]),
+            record.get("_source_image"),
+        )
+        _emit_progress(
+            progress_callback,
+            40 + round(50 * index / len(records)),
+            f"正在写入产品记录：{index}/{len(records)}",
         )
 
+    _check_conversion_cancel(cancel_requested)
+    _emit_progress(progress_callback, 92, "正在生成总成重量与汇总公式")
+    write_assembly_mass_formulas(template_sheet, records, target_slots)
     update_summary_formula_ranges(template_sheet, summary_start)
+    write_summary_formulas(template_sheet, summary_start, records, target_slots)
     template_book.calculation.fullCalcOnLoad = True
     template_book.calculation.forceFullCalc = True
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    template_book.save(output_path)
+    _check_conversion_cancel(cancel_requested)
+    _emit_progress(progress_callback, 97, "正在保存合并后的基础数据管制表")
+    normalized_output_path.parent.mkdir(parents=True, exist_ok=True)
+    template_book.save(normalized_output_path)
+    _emit_progress(progress_callback, 100, "模板合并转换完成")
+
+
+def convert(bom_path: Path, template_path: Path, output_path: Path) -> None:
+    """兼容旧调用：将一份 BOM 写入模板。"""
+    convert_many([bom_path], template_path, output_path)
 
 
 def default_output_path(bom_path: Path) -> Path:
     stem = bom_path.stem.replace("CATIA_图片清单_", "")
     return bom_path.parent / f"{stem}_基础数据管制表.xlsx"
+
+
+def choose_paths_in_dialog(start_directory: Path) -> tuple[Path, Path, Path]:
+    """显示文件选择窗口，依次获取 BOM、模板和输出位置。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ModuleNotFoundError as error:
+        raise RuntimeError("当前 Python 未安装 tkinter，无法显示文件选择窗口。") from error
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        excel_files = [("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")]
+
+        bom_name = filedialog.askopenfilename(
+            title="第 1 步：选择 CATIA BOM 图片清单",
+            initialdir=str(start_directory),
+            filetypes=excel_files,
+        )
+        if not bom_name:
+            raise RuntimeError("已取消选择 BOM 文件。")
+        bom_path = Path(bom_name)
+
+        template_name = filedialog.askopenfilename(
+            title="第 2 步：选择基础数据管制表模板",
+            initialdir=str(bom_path.parent),
+            filetypes=excel_files,
+        )
+        if not template_name:
+            raise RuntimeError("已取消选择模板文件。")
+        template_path = Path(template_name)
+
+        output_name = filedialog.asksaveasfilename(
+            title="第 3 步：选择转换结果的保存位置",
+            initialdir=str(bom_path.parent),
+            initialfile=default_output_path(bom_path).name,
+            defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx")],
+        )
+        if not output_name:
+            raise RuntimeError("已取消选择输出位置。")
+        return bom_path, template_path, Path(output_name)
+    except tk.TclError as error:
+        raise RuntimeError(
+            "无法显示文件选择窗口。请在 Windows 桌面会话中运行，"
+            "或使用 --bom、--template、--output 参数指定文件。"
+        ) from error
+    finally:
+        if root is not None:
+            root.destroy()
 
 
 def parse_args() -> argparse.Namespace:
@@ -422,29 +653,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bom",
         type=Path,
-        default=here / "CATIA_图片清单_STU-0000509373_03_20260901_135340.xlsx",
+        default=None,
         help="CATIA 图片清单 xlsx 文件",
     )
     parser.add_argument(
         "--template",
         type=Path,
-        default=here / "客户XXX-项目名XXX-基础数据管制表-日期.xlsx",
+        default=None,
         help="基础数据管制表模板 xlsx 文件",
     )
     parser.add_argument("--output", type=Path, default=None, help="输出 xlsx 文件")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.default_directory = here
+    return args
 
 
 def main() -> int:
     args = parse_args()
-    bom_path = args.bom.resolve()
-    template_path = args.template.resolve()
-    output_path = args.output.resolve() if args.output else default_output_path(bom_path)
+    if args.bom is None and args.template is None and args.output is None:
+        bom_path, template_path, output_path = choose_paths_in_dialog(args.default_directory)
+    else:
+        if args.bom is None or args.template is None:
+            raise ValueError("使用命令行模式时，必须同时提供 --bom 和 --template。")
+        bom_path = args.bom
+        template_path = args.template
+        output_path = args.output or default_output_path(bom_path)
+
+    bom_path = bom_path.resolve()
+    template_path = template_path.resolve()
+    output_path = output_path.resolve()
 
     if not bom_path.is_file():
         raise FileNotFoundError(f"未找到 BOM 文件：{bom_path}")
     if not template_path.is_file():
         raise FileNotFoundError(f"未找到模板文件：{template_path}")
+    if output_path in (bom_path, template_path):
+        raise ValueError("输出文件不能覆盖 BOM 文件或模板文件。")
 
     convert(bom_path, template_path, output_path)
     print(f"转换完成：{output_path}")

@@ -2,13 +2,16 @@
 """CATIA V5 BOM 导出（产品树 + 唯一件汇总 + Create Rough Stock 尺寸）。
 
 使用方法：
-1. 在 CATIA 中打开并激活一个 .CATProduct。
-2. 运行：python catia_bom_export_v2.py
+1. 单件模式：在 CATIA 中打开并激活一个 .CATProduct，运行：
+   python catia_bom_export_v2.py --mode single
+2. 批量模式：在“批量任务清单.txt”中每行写一个 .CATProduct 文件名或路径，运行：
+   python catia_bom_export_v2.py --mode batch
 
 输出：
 * CATIA_BOM_产品名_时间.xlsx
 * bom_images\ （每种唯一零件只生成一张图片）
 * CATIA_BOM_日志_时间.txt
+* 批量模式仅生成 CATIA_BOM_批量.xlsx（按任务清单顺序持续追加并重新编号）
 
 尺寸口径：对 CATPart 的 MainBody 建立临时 X/Y/Z 极值平面，测量两平面间距。
 这与 Create Rough Stock 默认坐标系下的包围盒口径一致。临时几何在每件
@@ -17,6 +20,8 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import math
 import re
@@ -26,16 +31,18 @@ import traceback
 import struct
 import tempfile
 import uuid
+from copy import copy
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 try:
     import pythoncom
     import win32com.client
-    from openpyxl import Workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.drawing.image import Image as ExcelImage
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -55,12 +62,38 @@ OUTPUT_DIR = BOM_OUTPUT_DIR
 IMAGE_SIZE = (600, 400)  # Excel 中原图的最大显示尺寸；文件本身不缩放
 BMP_CAPTURE_FORMAT = 4   # CATIA CatCaptureFormat: catCaptureFormatBMP（无损）
 TEMP_PREFIX = "__BOM_TEMP_ROUGH_STOCK__"
+BATCH_TASK_FILE = BASE_DIR / "批量任务清单.txt"
+BATCH_STATE_FILE = EXPORT_ROOT / "批量任务状态.json"
+BATCH_OUTPUT = BOM_OUTPUT_DIR / "CATIA_BOM_批量.xlsx"
 # SystemService.Evaluate 的 CATVBScriptLanguage 枚举值。
 CAT_VBSCRIPT_LANGUAGE = 1
 
 
 class BomExportError(RuntimeError):
     """用户可理解的导出错误。"""
+
+
+class ExportCancelled(BomExportError):
+    """用户请求结束导出；在 CATIA 安全操作边界停止。"""
+
+
+def _check_export_cancel(cancel_requested: Optional[Callable[[], bool]]) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise ExportCancelled("已收到取消请求：当前 CATIA 操作已安全结束，导出已取消。")
+
+
+def _emit_export_progress(
+    progress_callback: Optional[Callable[[int, str], None]],
+    percent: int,
+    message: str,
+) -> None:
+    """向 GUI/调用方报告进度；进度接收方异常不影响 CATIA 导出。"""
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(max(0, min(100, int(percent))), message)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -193,15 +226,22 @@ def com_text(value: Any) -> str:
         return ""
 
 
-def connect_catia(log: RunLog) -> Any:
+def connect_catia(log: RunLog, start_if_needed: bool = False) -> Any:
     try:
         catia = win32com.client.GetActiveObject("CATIA.Application")
     except Exception as exc:
-        raise BomExportError(
-            "未连接到正在运行的 CATIA。请确认 CATIA 已打开 .CATProduct，且 CATIA 与本工具"
-            "使用同一 Windows 用户和相同权限（两者都普通运行最简单）。另一台电脑请再检查"
-            "pywin32 已安装，并优先使用与 CATIA 位数一致的 Python。"
-        ) from exc
+        if not start_if_needed:
+            raise BomExportError(
+                "未连接到正在运行的 CATIA。请确认 CATIA 已打开 .CATProduct，且 CATIA 与本工具"
+                "使用同一 Windows 用户和相同权限（两者都普通运行最简单）。另一台电脑请再检查"
+                "pywin32 已安装，并优先使用与 CATIA 位数一致的 Python。"
+            ) from exc
+        try:
+            catia = win32com.client.Dispatch("CATIA.Application")
+            catia.Visible = True
+            log.info("已启动 CATIA，批量任务将依次打开 CATProduct")
+        except Exception as launch_exc:
+            raise BomExportError("无法启动 CATIA。请确认 CATIA 已正确安装且许可证可用。") from launch_exc
     log.info("已连接到 CATIA")
     return catia
 
@@ -2028,14 +2068,20 @@ def write_workbook(nodes: list[TreeNode], items: OrderedDict[str, BomItem], outp
     bom_ws = workbook.create_sheet("BOM汇总")
     log_ws = workbook.create_sheet("运行日志")
 
+    # 产品结构页同时作为“基础数据管制表”的唯一输入，必须保留结构、物性和图片。
     tree_headers = [
-        "层级", "树编号", "类型", "零件号", "版本", "零件名称", "实例名称", "父级路径", "数量", "图片", "X尺寸(mm)", "Y尺寸(mm)", "Z尺寸(mm)", "状态",
+        "树编号", "层级", "类型", "零件号", "版本", "零件名称", "实例名称", "父级路径",
+        "属性 Material", "PartBody Material", "材质比对",
+        "单件质量(kg)", "本级总质量(kg)", "测量密度(kg/m³)", "密度状态", "质量来源", "质量状态",
+        "包装包络长(mm)", "包装包络宽(mm)", "包装包络高(mm)",
+        "包络来源", "包络状态",
+        "名义厚度", "厚度来源", "本级数量", "缩略图", "截图状态",
     ]
     border, data_font, white_fill = configure_sheet(
         tree_ws,
         tree_headers,
         f"产品结构：{root_name}",
-        [8, 12, 10, 34, 10, 28, 32, 52, 8, 22, 14, 14, 14, 34],
+        [14, 8, 12, 36, 10, 30, 34, 56, 34, 38, 16, 15, 17, 20, 34, 24, 34, 16, 16, 16, 38, 52, 16, 24, 14, 25, 34],
     )
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left = Alignment(horizontal="left", vertical="center", wrap_text=True)
@@ -2045,27 +2091,64 @@ def write_workbook(nodes: list[TreeNode], items: OrderedDict[str, BomItem], outp
     item_by_key = dict(items)
     for row, node in enumerate(nodes, 3):
         item = item_by_key.get(node.unique_key) if node.is_leaf else None
+        image_path = item.image_path if item else node.image_path
+        image_status = item.image_status if item else node.image_status
+        material = item.material if item else None
+        thickness = item.nominal_thickness if item else None
+        dimensions = item.dimensions if item else None
+        mass = item.mass if item else None
+        unit_mass = mass.value_kg if mass and mass.status == "成功" else ""
+        level_mass = round(unit_mass * node.tree_quantity, 6) if unit_mass != "" else ""
+        density = mass.density_kg_m3 if mass and mass.status == "成功" and mass.density_kg_m3 is not None else ""
         type_label = "根产品" if node.level == 0 else ("零件" if node.is_leaf else "子总成")
-        dimensions = item.dimensions if item else DimensionResult()
-        status = f"尺寸：{dimensions.status}" if item else ""
-        if item:
-            status += f"；图片：{item.image_status}"
         values = [
-            node.level, node.tree_number, type_label, node.part_number, node.revision,
-            ("　" * node.level) + node.nomenclature, node.instance_name, node.parent_path,
-            item.quantity if item else "", "", dimensions.x, dimensions.y, dimensions.z, status,
+            node.tree_number,
+            node.level,
+            type_label,
+            node.part_number,
+            node.revision,
+            ("　" * node.level) + node.nomenclature,
+            node.instance_name,
+            node.parent_path,
+            material.property_material if material else "",
+            material.body_material if material else "",
+            material.comparison if material else "",
+            unit_mass,
+            level_mass,
+            density,
+            mass.density_status if mass else "",
+            mass.source if mass else "",
+            mass.status if mass else "",
+            dimensions.length if dimensions and dimensions.status == "成功" else "",
+            dimensions.width if dimensions and dimensions.status == "成功" else "",
+            dimensions.height if dimensions and dimensions.status == "成功" else "",
+            dimensions.source if dimensions else "",
+            dimensions.status if dimensions else "",
+            thickness.value if thickness else "",
+            thickness.source if thickness else "",
+            node.tree_quantity if item else "",
+            "",
+            image_status,
         ]
         fill = root_fill if node.level == 0 else (white_fill if node.is_leaf else assembly_fill)
         for column, value in enumerate(values, 1):
-            alignment = left if column in (4, 6, 7, 8, 14) else center
+            alignment = left if column in (4, 6, 7, 8, 9, 10, 15, 16, 17, 21, 22, 24, 27) else center
             style_cell(tree_ws.cell(row, column, value), data_font, fill, alignment, border)
-        if item and item.image_path:
-            tree_ws.row_dimensions[row].height = IMAGE_SIZE[1] * 0.75 + 6
-            add_image(tree_ws, f"J{row}", item.image_path)
+        for column in (12, 13):
+            tree_ws.cell(row, column).number_format = "0.000000"
+        tree_ws.cell(row, 14).number_format = "#,##0.000"
+        if material and material.comparison == "不一致":
+            mismatch_fill = PatternFill("solid", fgColor="FFC7CE")
+            mismatch_font = Font(name="微软雅黑", size=10, bold=True, color="9C0006")
+            for column in (9, 10, 11):
+                style_cell(tree_ws.cell(row, column), mismatch_font, mismatch_fill, left if column in (9, 10) else center, border)
+        display_size = add_image(tree_ws, f"Z{row}", image_path)
+        if display_size:
+            tree_ws.row_dimensions[row].height = display_size[1] * 0.75 + 6
         else:
             tree_ws.row_dimensions[row].height = 24
     if nodes:
-        tree_ws.auto_filter.ref = f"A2:N{len(nodes) + 2}"
+        tree_ws.auto_filter.ref = f"A2:AA{len(nodes) + 2}"
 
     bom_headers = [
         "序号", "零件号", "版本", "零件名称", "数量", "来源文件", "图片",
@@ -2111,42 +2194,558 @@ def write_workbook(nodes: list[TreeNode], items: OrderedDict[str, BomItem], outp
     workbook.save(output)
 
 
-def main() -> None:
-    pythoncom.CoInitialize()
+def _cleanup_capture_temp_files(image_directory: Path, log: RunLog, item_name: str) -> None:
+    """BMP 是截图转换 PNG 时的中间文件；批处理结束后不应残留。"""
+    for capture_path in image_directory.glob("*.bmp"):
+        try:
+            capture_path.unlink()
+            log.info("已清理截图临时文件", f"{item_name} {capture_path.name}")
+        except Exception as exc:
+            log.warning(f"清理截图临时文件失败：{exc}", f"{item_name} {capture_path.name}")
+
+
+def _restore_product_after_export(product_doc: Any, items: Optional[OrderedDict[str, BomItem]], log: RunLog) -> None:
+    """恢复显示状态并清除本工具创建/遗留的测量几何，不保存源文件。"""
+    if items:
+        for item in items.values():
+            if item.representative.part_doc is not None:
+                hide_stale_measurement_geometry(item.representative.part_doc, log, item.part_number)
+    try:
+        product_doc.Activate()
+        _set_all_leaf_visibility(product_doc, show=True)
+        product_doc.Application.ActiveWindow.ActiveViewer.Update()
+    except Exception as exc:
+        log.warning(f"恢复总成显示状态失败：{exc}")
+
+
+def export_product_document(
+    catia: Any,
+    product_doc: Any,
+    output: Path,
+    log: RunLog,
+    image_directory: Optional[Path] = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    cancel_requested: Optional[Callable[[], bool]] = None,
+) -> str:
+    """导出一个已经打开的 CATProduct；绝不调用 Save 或 SaveAs。
+
+    ``cancel_requested`` 用于 GUI 安全取消：CATIA 的单次测量/截图完成后才会
+    检查，避免中断 COM 操作并留下临时几何或异常显示状态。
+    """
+    global IMAGE_DIR
+    original_image_directory = IMAGE_DIR
+    if image_directory is not None:
+        IMAGE_DIR = image_directory
+
+    items: Optional[OrderedDict[str, BomItem]] = None
+    try:
+        _emit_export_progress(progress_callback, 1, "准备导出")
+        _check_export_cancel(cancel_requested)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        product_doc.Activate()
+        root_product = product_doc.Product
+        root_name = com_text(root_product.PartNumber) or com_text(product_doc.Name)
+        log.info("遍历产品树", root_name)
+        nodes = traverse_product_tree(catia, root_product, log)
+        items = create_bom_items(nodes)
+        _emit_export_progress(progress_callback, 8, f"已读取产品树：{len(items)} 种唯一零件")
+        _check_export_cancel(cancel_requested)
+        log.info(f"遍历完成：{len(nodes)} 个树节点，{len(items)} 种唯一零件")
+        if not items:
+            raise BomExportError("产品树没有可导出的叶子零件。")
+
+        # 完整图片清单：转换基础数据管制表所需的材质、厚度、质量、包络和图片。
+        log.info("读取属性 Material 与 PartBody Material")
+        populate_materials(items, log)
+        _emit_export_progress(progress_callback, 16, "材质读取完成")
+        _check_export_cancel(cancel_requested)
+        log.info("读取名义厚度")
+        populate_nominal_thicknesses(items, log)
+        _emit_export_progress(progress_callback, 24, "厚度读取完成")
+        _check_export_cancel(cancel_requested)
+        log.info("测量单件质量")
+        populate_masses(items, product_doc, log)
+        _emit_export_progress(progress_callback, 34, "质量测量完成")
+        _check_export_cancel(cancel_requested)
+        log.info("测量包装包络")
+        populate_rough_stock_dimensions(items, product_doc, log)
+        _emit_export_progress(progress_callback, 48, "包络尺寸测量完成")
+        _check_export_cancel(cancel_requested)
+
+        IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        for item in items.values():
+            if item.representative.part_doc is not None:
+                hide_stale_measurement_geometry(item.representative.part_doc, log, item.part_number)
+        _check_export_cancel(cancel_requested)
+
+        assembly_nodes = [node for node in nodes if not node.is_leaf]
+        log.info(f"生成 {len(assembly_nodes)} 个总成/分总成截图")
+        for index, node in enumerate(assembly_nodes, 1):
+            _check_export_cancel(cancel_requested)
+            log.info("生成总成截图", f"{index}/{len(assembly_nodes)} {node.tree_number} {node.part_number}")
+            capture_assembly_image(catia, node, product_doc, log)
+            _emit_export_progress(
+                progress_callback,
+                48 + round(16 * index / max(len(assembly_nodes), 1)),
+                f"总成截图：{index}/{len(assembly_nodes)}",
+            )
+        for index, item in enumerate(items.values(), 1):
+            _check_export_cancel(cancel_requested)
+            log.info("生成唯一件截图", f"{index}/{len(items)} {item.part_number}")
+            capture_part_image(catia, item, product_doc, log)
+            _emit_export_progress(
+                progress_callback,
+                64 + round(29 * index / max(len(items), 1)),
+                f"零件截图：{index}/{len(items)}",
+            )
+
+        _check_export_cancel(cancel_requested)
+        _emit_export_progress(progress_callback, 95, "正在写入 Excel")
+        write_workbook(nodes, items, output, root_name, log)
+        log.info(f"Excel 已生成：{output}")
+        _emit_export_progress(progress_callback, 100, "导出完成")
+        return root_name
+    finally:
+        _restore_product_after_export(product_doc, items, log)
+        _cleanup_capture_temp_files(IMAGE_DIR, log, com_text(product_doc.Name))
+        IMAGE_DIR = original_image_directory
+
+
+def _source_signature(product_path: Path) -> dict[str, int]:
+    stat = product_path.stat()
+    return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+
+
+def _load_batch_state() -> dict[str, Any]:
+    if not BATCH_STATE_FILE.exists():
+        return {"version": 1, "tasks": {}}
+    try:
+        state = json.loads(BATCH_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise BomExportError(f"无法读取批量任务状态文件：{BATCH_STATE_FILE}。{exc}") from exc
+    if not isinstance(state, dict) or not isinstance(state.get("tasks"), dict):
+        raise BomExportError(f"批量任务状态文件格式无效：{BATCH_STATE_FILE}")
+    return state
+
+
+def _save_batch_state(state: dict[str, Any]) -> None:
+    BATCH_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = BATCH_STATE_FILE.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_path.replace(BATCH_STATE_FILE)
+
+
+def _read_batch_task_lines(task_file: Path) -> list[str]:
+    """读取用户输入的多个 CATProduct 文件名；首次运行时创建示例任务清单。"""
+    if not task_file.exists():
+        task_file.write_text(
+            "# 每行一个 .CATProduct 文件名、相对路径或绝对路径。\n"
+            "# 只写文件名时，脚本会在 CATIATOOL 当前目录及其子目录中查找。\n"
+            "示例总成.CATProduct\n",
+            encoding="utf-8",
+        )
+        raise BomExportError(
+            f"已创建批量任务清单：{task_file}。请删掉示例行并填写多个 CATProduct 后重新运行。"
+        )
+    lines = [
+        line.strip()
+        for line in task_file.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not lines:
+        raise BomExportError(f"批量任务清单为空：{task_file}")
+    return lines
+
+
+def _resolve_batch_product(task_text: str) -> Path:
+    """优先按路径解析；只有文件名时，在项目目录中递归查找。"""
+    raw_path = Path(task_text)
+    candidates: list[Path] = []
+    if raw_path.suffix.lower() != ".catproduct":
+        raw_path = raw_path.with_suffix(".CATProduct")
+    direct_path = raw_path if raw_path.is_absolute() else BASE_DIR / raw_path
+    if direct_path.is_file():
+        return direct_path.resolve()
+
+    for candidate in BASE_DIR.rglob(raw_path.name):
+        if EXPORT_ROOT not in candidate.parents and candidate.is_file() and candidate.suffix.lower() == ".catproduct":
+            candidates.append(candidate.resolve())
+    unique_candidates = sorted(set(candidates), key=lambda item: str(item).casefold())
+    if not unique_candidates:
+        raise BomExportError(f"未找到 CATProduct：{task_text}")
+    if len(unique_candidates) > 1:
+        matches = "；".join(str(item.relative_to(BASE_DIR)) for item in unique_candidates[:5])
+        raise BomExportError(f"找到多个同名 CATProduct，请在任务清单填写相对路径：{task_text}（{matches}）")
+    return unique_candidates[0]
+
+
+def _close_document_without_saving(catia: Any, document: Any, log: RunLog, item_name: str) -> None:
+    """关闭当前批处理文档，明确不调用 Save/SaveAs，并抑制保存提示。"""
+    previous_alerts: Any = None
+    alerts_known = False
+    try:
+        previous_alerts = catia.DisplayFileAlerts
+        alerts_known = True
+        catia.DisplayFileAlerts = False
+    except Exception:
+        pass
+    try:
+        document.Close()
+        log.info("已关闭 CATProduct（未保存）", item_name)
+    finally:
+        if alerts_known:
+            try:
+                catia.DisplayFileAlerts = previous_alerts
+            except Exception:
+                pass
+
+
+def _write_run_log(log: RunLog, label: str) -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"CATIA_BOM_{clean_filename(label)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    log.save(log_path)
+    return log_path
+
+
+def _source_images_by_row(sheet: Any) -> dict[int, list[Any]]:
+    """按图片所在行整理图片，便于融合时跟随对应 BOM 行移动。"""
+    images_by_row: dict[int, list[Any]] = {}
+    for image in getattr(sheet, "_images", []):
+        anchor = getattr(image, "anchor", None)
+        origin = getattr(anchor, "_from", None)
+        if origin is None:
+            continue
+        # openpyxl 的图片行号从 0 开始，Excel 行号从 1 开始。
+        images_by_row.setdefault(origin.row + 1, []).append(image)
+    return images_by_row
+
+
+def _copy_image_to_row(source_image: Any, target_sheet: Any, target_row: int) -> tuple[int, int]:
+    """复制嵌入式图片，并复用单件模式的最大图片尺寸。"""
+    image_data = source_image._data()
+    copied_image = ExcelImage(BytesIO(image_data))
+    # load_workbook 重新读取图片时会回到原始 PNG/BMP 像素尺寸，不能直接复制
+    # source_image.width/height；否则会比单件模式中 add_image 的图片大很多。
+    scale = min(
+        IMAGE_SIZE[0] / copied_image.width,
+        IMAGE_SIZE[1] / copied_image.height,
+        1.0,
+    )
+    copied_image.width = round(copied_image.width * scale)
+    copied_image.height = round(copied_image.height * scale)
+    target_sheet.add_image(copied_image, f"Z{target_row}")
+    return copied_image.width, copied_image.height
+
+
+def _rebased_tree_number(source_tree_number: Any, root_sequence: int) -> Any:
+    """把一个独立 BOM 的根编号改为批量融合后的连续根编号。"""
+    tree_number = str(source_tree_number or "").strip()
+    if not tree_number:
+        return source_tree_number
+    segments = tree_number.split(".")
+    segments[0] = str(root_sequence)
+    return ".".join(segments)
+
+
+def append_product_to_batch_bom(
+    source_output: Path,
+    output: Path,
+    root_sequence: int,
+    create_new: bool,
+    log: RunLog,
+) -> int:
+    """把一个刚完成的临时 BOM 直接追加到唯一的批量 BOM，不保留单独输出表。"""
+    source_workbook = load_workbook(source_output)
+    target_workbook: Optional[Workbook] = None
+    try:
+        if "产品结构" not in source_workbook.sheetnames:
+            raise BomExportError(f"临时 BOM 缺少“产品结构”工作表：{source_output}")
+        source_sheet = source_workbook["产品结构"]
+        source_images = _source_images_by_row(source_sheet)
+
+        if create_new:
+            # 第一项直接以原 BOM 的版式作为批量 BOM 的基础，只清除其中的明细行。
+            target_workbook = load_workbook(source_output)
+            for sheet_name in list(target_workbook.sheetnames):
+                if sheet_name != "产品结构":
+                    del target_workbook[sheet_name]
+            target_sheet = target_workbook["产品结构"]
+            target_sheet["A1"] = "产品结构：批量导出"
+            target_sheet._images = []
+            if target_sheet.max_row > 2:
+                target_sheet.delete_rows(3, target_sheet.max_row - 2)
+            destination_row = 3
+        else:
+            if not output.is_file():
+                raise BomExportError(f"批量 BOM 不存在，无法继续追加：{output}")
+            target_workbook = load_workbook(output)
+            if "产品结构" not in target_workbook.sheetnames:
+                raise BomExportError(f"批量 BOM 缺少“产品结构”工作表：{output}")
+            target_sheet = target_workbook["产品结构"]
+            destination_row = 3
+            for row in range(target_sheet.max_row, 2, -1):
+                if target_sheet.cell(row, 1).value not in (None, ""):
+                    destination_row = row + 1
+                    break
+
+        added_records = 0
+        for source_row in range(3, source_sheet.max_row + 1):
+            source_tree_number = source_sheet.cell(source_row, 1).value
+            if source_tree_number in (None, ""):
+                continue
+            for column in range(1, source_sheet.max_column + 1):
+                source_cell = source_sheet.cell(source_row, column)
+                destination_cell = target_sheet.cell(destination_row, column)
+                if source_cell.has_style:
+                    destination_cell._style = copy(source_cell._style)
+                if source_cell.number_format:
+                    destination_cell.number_format = source_cell.number_format
+                destination_cell.value = (
+                    _rebased_tree_number(source_tree_number, root_sequence)
+                    if column == 1
+                    else source_cell.value
+                )
+                if source_cell.hyperlink:
+                    destination_cell._hyperlink = copy(source_cell.hyperlink)
+
+            source_dimension = source_sheet.row_dimensions[source_row]
+            target_dimension = target_sheet.row_dimensions[destination_row]
+            image_sizes = [
+                _copy_image_to_row(source_image, target_sheet, destination_row)
+                for source_image in source_images.get(source_row, [])
+            ]
+            target_dimension.height = (
+                max(height for _, height in image_sizes) * 0.75 + 6
+                if image_sizes
+                else source_dimension.height
+            )
+            target_dimension.hidden = source_dimension.hidden
+            destination_row += 1
+            added_records += 1
+
+        last_row = destination_row - 1
+        target_sheet.auto_filter.ref = f"A2:AA{max(last_row, 2)}"
+        target_sheet.freeze_panes = "A3"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary_output = output.with_name(f".{output.stem}.tmp{output.suffix}")
+        try:
+            target_workbook.save(temporary_output)
+            temporary_output.replace(output)
+        finally:
+            if temporary_output.exists():
+                temporary_output.unlink()
+        log.info("已追加到批量 BOM", f"{root_sequence}：{added_records} 个节点")
+        return added_records
+    finally:
+        source_workbook.close()
+        if target_workbook is not None:
+            target_workbook.close()
+
+
+def run_single_mode() -> None:
     log = RunLog()
     started = time.time()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
         BOM_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
         catia = connect_catia(log)
         product_doc, root_product = get_active_product_document(catia)
         root_name = com_text(root_product.PartNumber) or com_text(product_doc.Name)
-        log.info("遍历产品树", root_name)
-        nodes = traverse_product_tree(catia, root_product, log)
-        items = create_bom_items(nodes)
-        log.info(f"遍历完成：{len(nodes)} 个树节点，{len(items)} 种唯一零件")
-        if not items:
-            raise BomExportError("产品树没有可导出的叶子零件。")
-
-        prepare_images_and_dimensions(catia, product_doc, items, log)
         output = OUTPUT_DIR / f"CATIA_BOM_{clean_filename(root_name)}_{timestamp}.xlsx"
-        write_workbook(nodes, items, output, root_name, log)
-        log.info(f"Excel 已生成：{output}")
+        export_product_document(catia, product_doc, output, log)
         print(f"\n完成，用时 {time.time() - started:.1f} 秒。")
         print(f"Excel：{output}")
-    except BomExportError as exc:
-        log.error(str(exc))
-        print(f"\n导出失败：{exc}")
     except Exception as exc:
-        log.error(f"未处理异常：{exc}")
+        log.error(f"导出失败：{exc}")
         traceback.print_exc()
-        print(f"\n导出失败：{exc}")
     finally:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = LOG_DIR / f"CATIA_BOM_日志_{timestamp}.txt"
-        log.save(log_path)
+        log_path = _write_run_log(log, "日志")
         print(f"日志：{log_path}")
+
+
+def run_batch_mode(task_file: Path, supplied_tasks: list[str]) -> None:
+    """按任务清单串行处理 CATProduct；每项失败独立记录且不影响后续任务。"""
+    batch_log = RunLog()
+    failed_items: list[str] = []
+    try:
+        state = _load_batch_state()
+        task_lines = supplied_tasks or _read_batch_task_lines(task_file)
+        batch_jobs: list[dict[str, Any]] = []
+
+        # 先解析所有任务，借此判断旧的批量 BOM 能否在末尾继续追加。
+        # 任务顺序、来源文件或已有融合状态变化时，会在本次重新建立唯一的批量 BOM。
+        for task_text in task_lines:
+            task_key = f"input:{task_text}"
+            try:
+                product_path = _resolve_batch_product(task_text)
+                task_key = str(product_path).casefold()
+                batch_jobs.append(
+                    {
+                        "task_text": task_text,
+                        "task_key": task_key,
+                        "product_path": product_path,
+                        "signature": _source_signature(product_path),
+                    }
+                )
+            except Exception as exc:
+                error_text = str(exc)
+                failed_items.append(task_text)
+                batch_log.error(f"批量任务失败：{error_text}", task_text)
+                state["tasks"][task_key] = {
+                    "status": "failed",
+                    "source": task_text,
+                    "error": error_text,
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                _save_batch_state(state)
+
+        planned_keys = [job["task_key"] for job in batch_jobs]
+        previous_batch = state.get("batch_output", {})
+        previous_keys = previous_batch.get("task_keys", []) if isinstance(previous_batch, dict) else []
+        can_append = (
+            BATCH_OUTPUT.is_file()
+            and isinstance(previous_keys, list)
+            and previous_batch.get("image_size") == list(IMAGE_SIZE)
+            and planned_keys[:len(previous_keys)] == previous_keys
+            and len(previous_keys) <= len(planned_keys)
+        )
+        if can_append:
+            for job in batch_jobs[:len(previous_keys)]:
+                prior = state["tasks"].get(job["task_key"], {})
+                if prior.get("status") != "completed" or prior.get("signature") != job["signature"]:
+                    can_append = False
+                    break
+
+        included_task_keys: list[str] = list(previous_keys) if can_append else []
+        if not can_append and (previous_keys or BATCH_OUTPUT.is_file()):
+            batch_log.info("任务顺序或源文件已变化，本次重新建立批量 BOM")
+
+        if batch_jobs:
+            catia = connect_catia(batch_log, start_if_needed=True)
+        else:
+            catia = None
+
+        for root_sequence, job in enumerate(batch_jobs, 1):
+            document = None
+            product_path: Path = job["product_path"]
+            task_key: str = job["task_key"]
+            signature: dict[str, int] = job["signature"]
+            job_log = RunLog()
+            try:
+                prior = state["tasks"].get(task_key, {})
+                if (
+                    prior.get("status") == "completed"
+                    and prior.get("signature") == signature
+                    and task_key in included_task_keys
+                ):
+                    batch_log.info("已完成，跳过", str(product_path))
+                    continue
+
+                batch_log.info("开始批量任务", str(product_path))
+                if catia is None:
+                    raise BomExportError("CATIA 未启动，无法处理批量任务。")
+                document = catia.Documents.Open(str(product_path))
+                if not com_text(document.Name).lower().endswith(".catproduct"):
+                    raise BomExportError(f"打开的文件不是 CATProduct：{product_path}")
+                image_directory = IMAGE_DIR / clean_filename(product_path.stem)
+                # 单个总成只写入系统临时目录，用完立即删除；用户目录中只保留 BATCH_OUTPUT。
+                with tempfile.TemporaryDirectory(prefix="CATIA_BOM_BATCH_") as temporary_directory:
+                    staging_output = Path(temporary_directory) / "当前总成.xlsx"
+                    export_product_document(catia, document, staging_output, job_log, image_directory)
+                    append_product_to_batch_bom(
+                        staging_output,
+                        BATCH_OUTPUT,
+                        root_sequence,
+                        create_new=not included_task_keys,
+                        log=job_log,
+                    )
+                _close_document_without_saving(catia, document, job_log, product_path.name)
+                document = None
+                job_log_path = _write_run_log(job_log, f"日志_{product_path.stem}")
+                state["tasks"][task_key] = {
+                    "status": "completed",
+                    "source": str(product_path),
+                    "signature": signature,
+                    "output": str(BATCH_OUTPUT),
+                    "root_sequence": root_sequence,
+                    "log": str(job_log_path),
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                included_task_keys.append(task_key)
+                state["batch_output"] = {
+                    "output": str(BATCH_OUTPUT),
+                    "task_keys": included_task_keys,
+                    "image_size": list(IMAGE_SIZE),
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                _save_batch_state(state)
+                batch_log.info("批量任务完成", str(product_path))
+            except Exception as exc:
+                error_text = str(exc)
+                failed_items.append(str(product_path))
+                batch_log.error(f"批量任务失败：{error_text}", str(product_path))
+                job_log.error(f"批量任务失败：{error_text}", str(product_path))
+                job_log_path = _write_run_log(job_log, f"日志_{product_path.stem}")
+                state["tasks"][task_key] = {
+                    "status": "failed",
+                    "source": str(product_path),
+                    "error": error_text,
+                    "log": str(job_log_path),
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                _save_batch_state(state)
+            finally:
+                if document is not None:
+                    try:
+                        if catia is None:
+                            raise BomExportError("CATIA 未启动，无法关闭 CATProduct。")
+                        _close_document_without_saving(catia, document, batch_log, str(product_path))
+                    except Exception as close_exc:
+                        failed_items.append(str(product_path))
+                        batch_log.error(f"关闭 CATProduct 失败：{close_exc}", str(product_path))
+
+        if included_task_keys:
+            print(f"批量 BOM：{BATCH_OUTPUT}")
+        else:
+            batch_log.warning("本次没有成功任务，未生成批量 BOM。")
+
+        if failed_items:
+            unique_failed = list(dict.fromkeys(failed_items))
+            batch_log.error("批量完成，但存在失败项：" + "；".join(unique_failed))
+            print("\n以下任务失败，可直接再次运行批量模式重试：")
+            for item in unique_failed:
+                print(f"- {item}")
+        else:
+            batch_log.info("批量任务全部完成")
+    finally:
+        log_path = _write_run_log(batch_log, "批量日志")
+        print(f"批量日志：{log_path}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="CATIA BOM 导出：单件模式或可断点续跑的批量模式")
+    parser.add_argument("--mode", choices=("single", "batch"), default="single", help="single：当前活动总成；batch：按任务清单依次处理")
+    parser.add_argument("--task-file", type=Path, default=BATCH_TASK_FILE, help="批量任务清单（每行一个 CATProduct 文件名或路径）")
+    parser.add_argument("--products", nargs="*", default=[], help="批量任务名；指定后无需读取任务清单")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    pythoncom.CoInitialize()
+    try:
+        try:
+            if args.mode == "batch":
+                run_batch_mode(args.task_file.resolve(), args.products)
+            else:
+                run_single_mode()
+        except Exception as exc:
+            print(f"\n执行失败：{exc}")
+            traceback.print_exc()
+    finally:
         pythoncom.CoUninitialize()
 
 

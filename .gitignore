@@ -1,0 +1,13 @@
+# Local Python runtimes and bytecode caches
+__pycache__/
+*.py[cod]
+CATIA_BOM_GUI/.venv/
+
+# Generated CATIA BOM runtime output (not source code)
+CATIA_BOM导出/
+CATIA_BOM_*.xlsx
+CATIA_BOM_*.xlsm
+CATIA_BOM_*.xls
+**/零件图片/
+**/日志/
+DEMO_*/输出/
