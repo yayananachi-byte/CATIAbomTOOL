@@ -24,14 +24,23 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
-APP_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = APP_DIR.parent
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+if IS_FROZEN:
+    APP_DIR = Path(sys.executable).resolve().parent
+    PROJECT_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR)).resolve()
+    USER_DATA_DIR = Path.home() / "Documents" / "YR CATIA BOM Manager"
+else:
+    APP_DIR = Path(__file__).resolve().parent
+    PROJECT_DIR = APP_DIR.parent
+    USER_DATA_DIR = PROJECT_DIR
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-APP_NAME = "CATIA BOM Manager"
-DEFAULT_EXPORT_DIR = PROJECT_DIR / "CATIA_BOM导出" / "GUI导出"
+APP_NAME = "YR CATIA BOM Manager"
+DEFAULT_EXPORT_DIR = USER_DATA_DIR / "CATIA_BOM导出" / "GUI导出"
 CONVERTER_PATH = PROJECT_DIR / "模板转化" / "bom_to_control_table.py"
+ICON_PATH = PROJECT_DIR / "assets" / "YR.ico"
+DEFAULT_TEMPLATE_PATH = "" if IS_FROZEN else str(PROJECT_DIR / "客户XXX-项目名XXX-基础数据管制表-日期.xlsx")
 bom: Any = None
 
 
@@ -43,6 +52,11 @@ def load_bom_core() -> Any:
     try:
         bom = importlib.import_module("catia_bom_export_v2")
     except SystemExit as exc:
+        if IS_FROZEN:
+            raise RuntimeError(
+                "软件运行组件不完整，请重新运行 YR 安装程序执行安装或修复。\n\n"
+                f"原始提示：{exc}"
+            ) from exc
         raise RuntimeError(
             "导出内核依赖未安装。请在本目录终端执行：\n"
             "python -m pip install -r requirements.txt\n\n"
@@ -289,6 +303,11 @@ class BomManagerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
+        if ICON_PATH.is_file():
+            try:
+                self.iconbitmap(default=str(ICON_PATH))
+            except tk.TclError:
+                pass
         self.geometry("1120x740")
         self.minsize(940, 620)
         self.events: queue.Queue = queue.Queue()
@@ -299,7 +318,7 @@ class BomManagerApp(tk.Tk):
         self.export_mode = tk.StringVar(value="active")
         self.export_directory = tk.StringVar(value=str(DEFAULT_EXPORT_DIR))
         self.template_bom_paths: list[str] = []
-        self.template_file = tk.StringVar(value=str(PROJECT_DIR / "客户XXX-项目名XXX-基础数据管制表-日期.xlsx"))
+        self.template_file = tk.StringVar(value=DEFAULT_TEMPLATE_PATH)
         self.template_output = tk.StringVar()
         self.status = tk.StringVar(value="就绪")
         self.progress_value = tk.IntVar(value=0)
@@ -642,7 +661,31 @@ class BomManagerApp(tk.Tk):
         self.destroy()
 
 
+def run_packaged_self_check() -> int:
+    """Validate bundled runtime components without connecting to or changing CATIA."""
+    try:
+        import openpyxl  # noqa: F401
+        import pythoncom  # noqa: F401
+        from PIL import Image  # noqa: F401
+
+        load_bom_core()
+        if not CONVERTER_PATH.is_file():
+            raise FileNotFoundError(f"模板转换组件不存在：{CONVERTER_PATH}")
+        spec = importlib.util.spec_from_file_location("bom_to_control_table_self_check", CONVERTER_PATH)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("无法加载模板转换组件。")
+        converter = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = converter
+        spec.loader.exec_module(converter)
+        return 0
+    except Exception:
+        traceback.print_exc()
+        return 1
+
+
 def main() -> None:
+    if "--self-check" in sys.argv:
+        raise SystemExit(run_packaged_self_check())
     app = BomManagerApp()
     app.mainloop()
 
