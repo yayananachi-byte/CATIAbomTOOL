@@ -6,6 +6,7 @@ CATIA_BOM_GUI/.venv/
 # PyInstaller build artifacts (rebuild locally; do not store binaries in Git)
 YR_CATIA_BOM_INSTALLER_20261101/build/
 YR_CATIA_BOM_INSTALLER_20261101/dist/
+YR_CATIA_BOM_INSTALLER_20261101/secure_build/
 
 # Generated CATIA BOM runtime output (not source code)
 CATIA_BOM导出/

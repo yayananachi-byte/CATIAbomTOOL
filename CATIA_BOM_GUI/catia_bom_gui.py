@@ -3,6 +3,7 @@
 
 功能：
 * 导出当前 CATIA 总成，或选择多个 CATProduct 串行导出；
+* 一键导出 BOM，并在导出成功后自动转换为客户模板；
 * 将已导出的 BOM 转写到客户基础数据管制表模板；
 * 显示实时日志、进度与安全取消状态；
 * 所有 CATIA 操作在后台 STA 线程中执行，界面不会冻结。
@@ -103,6 +104,8 @@ class GuiWorker(threading.Thread):
         self.payload = payload
         self.events = events
         self.cancel_event = threading.Event()
+        self._progress_start = 0
+        self._progress_span = 100
 
     def request_cancel(self) -> None:
         self.cancel_event.set()
@@ -112,7 +115,9 @@ class GuiWorker(threading.Thread):
         self.events.put(("log", level, item, message))
 
     def _progress(self, percent: int, message: str) -> None:
-        self.events.put(("progress", max(0, min(100, int(percent))), message))
+        percent = max(0, min(100, int(percent)))
+        scaled = self._progress_start + round(percent * self._progress_span / 100)
+        self.events.put(("progress", max(0, min(100, scaled)), message))
 
     def _cancel_requested(self) -> bool:
         return self.cancel_event.is_set()
@@ -123,6 +128,8 @@ class GuiWorker(threading.Thread):
         try:
             if self.action == "export":
                 summary = self._run_export()
+            elif self.action == "export_and_convert":
+                summary = self._run_export_and_convert()
             elif self.action == "convert":
                 summary = self._run_convert()
             else:
@@ -142,6 +149,18 @@ class GuiWorker(threading.Thread):
     def _timestamp() -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    @staticmethod
+    def _available_output_path(path: Path) -> Path:
+        """为自动命名结果选择未占用的文件名，避免覆盖已有交付文件。"""
+        if not path.exists():
+            return path
+        index = 2
+        while True:
+            candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+            if not candidate.exists():
+                return candidate
+            index += 1
+
     def _save_log(self, log: GuiRunLog, output_dir: Path, name: str) -> Path:
         log_dir = output_dir / "日志"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -149,12 +168,13 @@ class GuiWorker(threading.Thread):
         log.save(path)
         return path
 
-    def _run_export(self) -> dict[str, Any]:
+    def _run_export(self, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        payload = payload or self.payload
         core = load_bom_core()
-        output_dir = Path(self.payload["output_dir"]).resolve()
+        output_dir = Path(payload["output_dir"]).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        mode = self.payload["mode"]
-        product_paths = [Path(value).resolve() for value in self.payload.get("products", [])]
+        mode = payload["mode"]
+        product_paths = [Path(value).resolve() for value in payload.get("products", [])]
         timestamp = self._timestamp()
         log = self._create_log()
         results: list[str] = []
@@ -259,10 +279,82 @@ class GuiWorker(threading.Thread):
             "output_dir": str(output_dir),
         }
 
-    def _run_convert(self) -> dict[str, Any]:
-        bom_paths = [Path(value).resolve() for value in self.payload["bom_paths"]]
+    def _run_export_and_convert(self) -> dict[str, Any]:
+        export_payload = self.payload["export"]
         template_path = Path(self.payload["template_path"]).resolve()
-        output_path = Path(self.payload["output_path"]).resolve()
+        requested_output = self.payload.get("output_path", "").strip()
+
+        if not template_path.is_file():
+            raise FileNotFoundError(f"找不到基础数据管制表模板：{template_path}")
+
+        self._log("INFO", "", "开始一键任务：先导出 BOM，成功后自动转换模板。")
+        self._progress_start = 0
+        self._progress_span = 80
+        export_summary = self._run_export(export_payload)
+        export_results = list(export_summary.get("results", []))
+
+        if export_summary.get("cancelled"):
+            return export_summary
+        if export_summary.get("failed") or not export_results:
+            self._log("WARNING", "", "BOM 导出未全部成功，已跳过模板转换，避免生成不完整的管制表。")
+            return export_summary
+
+        if requested_output:
+            output_path = Path(requested_output).resolve()
+        else:
+            output_dir = Path(export_summary["output_dir"]).resolve()
+            timestamp = self._timestamp()
+            if len(export_results) == 1:
+                name = f"{Path(export_results[0]).stem}_基础数据管制表.xlsx"
+            else:
+                name = f"CATIA_BOM_合并_{timestamp}_基础数据管制表.xlsx"
+            output_path = self._available_output_path(output_dir / name)
+
+        self._log("INFO", "", f"BOM 导出完成，开始自动转换模板：{output_path}")
+        self._progress_start = 80
+        self._progress_span = 20
+        try:
+            convert_summary = self._run_convert(
+                {
+                    "bom_paths": export_results,
+                    "template_path": str(template_path),
+                    "output_path": str(output_path),
+                }
+            )
+        except Exception as exc:
+            self.events.put(("traceback", traceback.format_exc()))
+            return {
+                "failed": True,
+                "results": export_results,
+                "failures": [f"BOM 已导出，但自动模板转换失败：{exc}"],
+                "message": str(exc),
+                "output_dir": export_summary.get("output_dir"),
+            }
+        finally:
+            self._progress_start = 0
+            self._progress_span = 100
+
+        if convert_summary.get("cancelled"):
+            return {
+                "cancelled": True,
+                "results": export_results,
+                "output_dir": convert_summary.get("output_dir", export_summary.get("output_dir")),
+            }
+
+        converted_results = list(convert_summary.get("results", []))
+        self._log("INFO", "", "一键任务完成：BOM 导出和模板转换均已完成。")
+        return {
+            "results": export_results + converted_results,
+            "export_results": export_results,
+            "converted_results": converted_results,
+            "output_dir": convert_summary.get("output_dir", export_summary.get("output_dir")),
+        }
+
+    def _run_convert(self, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        payload = payload or self.payload
+        bom_paths = [Path(value).resolve() for value in payload["bom_paths"]]
+        template_path = Path(payload["template_path"]).resolve()
+        output_path = Path(payload["output_path"]).resolve()
         if self._cancel_requested():
             return {"cancelled": True}
         if not CONVERTER_PATH.is_file():
@@ -320,6 +412,7 @@ class BomManagerApp(tk.Tk):
         self.template_bom_paths: list[str] = []
         self.template_file = tk.StringVar(value=DEFAULT_TEMPLATE_PATH)
         self.template_output = tk.StringVar()
+        self.auto_convert_output = tk.StringVar()
         self.status = tk.StringVar(value="就绪")
         self.progress_value = tk.IntVar(value=0)
 
@@ -403,9 +496,28 @@ class BomManagerApp(tk.Tk):
         self.clear_products_button.grid(row=2, column=2, sticky="ew", padx=(10, 0))
         ttk.Label(task_frame, text="批量模式将依次打开、导出并关闭文件，不保存客户源文件。", style="Hint.TLabel", wraplength=220).grid(row=3, column=2, sticky="sw", padx=(10, 0))
 
+        auto_frame = ttk.LabelFrame(tab, text="导出后自动转换", padding=10)
+        auto_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        auto_frame.columnconfigure(1, weight=1)
+        self._add_path_row(auto_frame, 0, "管制表模板", self.template_file, self._choose_template_file)
+        self._add_path_row(auto_frame, 1, "转换结果（可留空）", self.auto_convert_output, self._choose_auto_convert_output)
+        ttk.Label(
+            auto_frame,
+            text="结果留空时会在 BOM 导出目录自动生成；批量导出会把本批次 BOM 合并到同一份模板。",
+            style="Hint.TLabel",
+            wraplength=760,
+        ).grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(2, 0))
+
         button_frame = ttk.Frame(tab)
-        button_frame.grid(row=3, column=1, columnspan=2, sticky="e", pady=(16, 0))
-        self.export_button = ttk.Button(button_frame, text="开始导出 BOM", style="Accent.TButton", command=self._start_export)
+        button_frame.grid(row=4, column=1, columnspan=2, sticky="e", pady=(16, 0))
+        self.export_and_convert_button = ttk.Button(
+            button_frame,
+            text="一键导出并转换",
+            style="Accent.TButton",
+            command=self._start_export_and_conversion,
+        )
+        self.export_and_convert_button.pack(side="right")
+        self.export_button = ttk.Button(button_frame, text="仅导出 BOM", command=self._start_export)
         self.export_button.pack(side="right")
         ttk.Button(button_frame, text="检测 CATIA", command=self._check_catia_ready).pack(side="right", padx=(0, 8))
         self._refresh_mode()
@@ -525,6 +637,20 @@ class BomManagerApp(tk.Tk):
         if value:
             self.template_output.set(value)
 
+    def _choose_auto_convert_output(self) -> None:
+        export_dir = Path(self.export_directory.get().strip() or DEFAULT_EXPORT_DIR)
+        current = self.auto_convert_output.get().strip()
+        initial = Path(current) if current else export_dir / "自动转换_基础数据管制表.xlsx"
+        value = filedialog.asksaveasfilename(
+            title="保存自动转换结果",
+            initialfile=initial.name,
+            initialdir=str(initial.parent),
+            defaultextension=".xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx")],
+        )
+        if value:
+            self.auto_convert_output.set(value)
+
     def _check_catia_ready(self) -> None:
         try:
             import pythoncom
@@ -541,14 +667,37 @@ class BomManagerApp(tk.Tk):
             messagebox.showerror("CATIA 检测失败", str(exc))
 
     def _start_export(self) -> None:
+        export_payload = self._get_export_payload()
+        if export_payload is None:
+            return
+        self._start_worker("export", export_payload)
+
+    def _get_export_payload(self) -> Optional[dict[str, Any]]:
         directory = self.export_directory.get().strip()
         if not directory:
             messagebox.showwarning("缺少输出目录", "请选择 BOM 输出目录。")
-            return
+            return None
         if self.export_mode.get() == "batch" and not self.product_paths:
             messagebox.showwarning("缺少任务", "批量模式请至少添加一个 CATProduct。")
+            return None
+        return {"mode": self.export_mode.get(), "output_dir": directory, "products": list(self.product_paths)}
+
+    def _start_export_and_conversion(self) -> None:
+        export_payload = self._get_export_payload()
+        if export_payload is None:
             return
-        self._start_worker("export", {"mode": self.export_mode.get(), "output_dir": directory, "products": list(self.product_paths)})
+        template_path = self.template_file.get().strip()
+        if not template_path:
+            messagebox.showwarning("缺少模板", "请选择基础数据管制表模板。")
+            return
+        self._start_worker(
+            "export_and_convert",
+            {
+                "export": export_payload,
+                "template_path": template_path,
+                "output_path": self.auto_convert_output.get().strip(),
+            },
+        )
 
     def _start_conversion(self) -> None:
         values = {
@@ -568,6 +717,7 @@ class BomManagerApp(tk.Tk):
         self.progress_value.set(0)
         self.status.set("任务启动中")
         self.export_button.configure(state="disabled")
+        self.export_and_convert_button.configure(state="disabled")
         self.convert_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self._append_log("INFO", "", f"启动任务：{action}")
@@ -603,6 +753,7 @@ class BomManagerApp(tk.Tk):
 
     def _finish_task(self, success: bool, summary: dict[str, Any]) -> None:
         self.export_button.configure(state="normal")
+        self.export_and_convert_button.configure(state="normal")
         self.convert_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
         self.worker = None
