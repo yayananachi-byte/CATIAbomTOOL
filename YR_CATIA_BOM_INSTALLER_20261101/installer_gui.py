@@ -43,6 +43,8 @@ INSTALL_DIR = LOCAL_APPDATA / "Programs" / APP_NAME
 APP_EXE_PATH = INSTALL_DIR / APP_EXE_NAME
 INSTALLED_SETUP_PATH = INSTALL_DIR / SETUP_EXE_NAME
 USER_DATA_DIR = Path.home() / "Documents" / APP_NAME
+AUTHORIZATION_FOLDER_NAME = "ZYRROOY"
+AUTHORIZATION_FOLDER = INSTALL_DIR / AUTHORIZATION_FOLDER_NAME
 
 
 def is_installed() -> bool:
@@ -160,6 +162,7 @@ def write_install_info() -> None:
         "user_data_dir": str(USER_DATA_DIR),
         "python_runtime": "bundled",
         "administrator_required": False,
+        "authorization_folder": AUTHORIZATION_FOLDER_NAME,
     }
     (INSTALL_DIR / "install_info.json").write_text(
         json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -183,6 +186,10 @@ def copy_application_payload(progress: Callable[[str], None]) -> None:
 
     if not APP_EXE_PATH.is_file():
         raise RuntimeError(f"主程序安装失败，未找到：{APP_EXE_PATH}")
+    # 此目录刻意为空，仅作发布版启动时的安装授权标记，不存放任何业务文件。
+    AUTHORIZATION_FOLDER.mkdir(exist_ok=True)
+    if not AUTHORIZATION_FOLDER.is_dir():
+        raise RuntimeError("无法创建授权安装目录 ZYRROOY。")
 
 
 def install_application(progress: Callable[[str], None]) -> str:
@@ -204,7 +211,9 @@ def install_application(progress: Callable[[str], None]) -> str:
         )
 
     progress("正在写入卸载程序")
-    shutil.copy2(Path(sys.executable), INSTALLED_SETUP_PATH)
+    # 从安装目录内执行覆盖更新时，源和目标相同，无需复制自身。
+    if Path(sys.executable).resolve() != INSTALLED_SETUP_PATH.resolve():
+        shutil.copy2(Path(sys.executable), INSTALLED_SETUP_PATH)
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     write_install_info()
 
@@ -215,7 +224,8 @@ def install_application(progress: Callable[[str], None]) -> str:
         f"{APP_NAME} {APP_VERSION} 安装完成。\n\n"
         f"安装位置：{INSTALL_DIR}\n"
         f"输出文件默认保存在：{USER_DATA_DIR}\n\n"
-        "Python 和所需组件已经内置，不需要另外安装。"
+        "Python 和所需组件已经内置，不需要另外安装。\n"
+        "已创建授权目录 ZYRROOY，请勿删除或改名。"
     )
 
 

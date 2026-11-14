@@ -11,12 +11,14 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import queue
 import sys
 import threading
 import traceback
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -38,9 +40,12 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 APP_NAME = "YR CATIA BOM Manager"
+AUTHORIZATION_FOLDER_NAME = "ZYRROOY"
+AUTHORIZATION_FOLDER = APP_DIR / AUTHORIZATION_FOLDER_NAME
 DEFAULT_EXPORT_DIR = USER_DATA_DIR / "CATIA_BOM导出" / "GUI导出"
 CONVERTER_PATH = PROJECT_DIR / "模板转化" / "bom_to_control_table.py"
 ICON_PATH = PROJECT_DIR / "assets" / "YR.ico"
+CORE_PATH = APP_DIR / "catia_bom_export_v2.py"
 DEFAULT_TEMPLATE_PATH = "" if IS_FROZEN else str(PROJECT_DIR / "客户XXX-项目名XXX-基础数据管制表-日期.xlsx")
 bom: Any = None
 
@@ -51,7 +56,24 @@ def load_bom_core() -> Any:
     if bom is not None:
         return bom
     try:
-        bom = importlib.import_module("catia_bom_export_v2")
+        if IS_FROZEN:
+            # 打包后由 PyInstaller 从内置模块加载。
+            bom = importlib.import_module("catia_bom_export_v2")
+        else:
+            # 开发版始终使用 CATIA_BOM_GUI 内的内核，避免误加载仓库根目录的旧脚本。
+            if not CORE_PATH.is_file():
+                raise FileNotFoundError(f"找不到 GUI 导出内核：{CORE_PATH}")
+            spec = importlib.util.spec_from_file_location("catia_bom_export_v2", CORE_PATH)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"无法创建导出内核加载器：{CORE_PATH}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(spec.name, None)
+                raise
+            bom = module
     except SystemExit as exc:
         if IS_FROZEN:
             raise RuntimeError(
@@ -66,6 +88,40 @@ def load_bom_core() -> Any:
     except Exception as exc:
         raise RuntimeError(f"无法加载 CATIA BOM 导出内核：{exc}") from exc
     return bom
+
+
+def has_installation_permission() -> bool:
+    """发布版必须保留安装器创建的空授权标记目录。"""
+    # 源码运行用于开发和测试，不要求创建安装器专用目录。
+    return not IS_FROZEN or AUTHORIZATION_FOLDER.is_dir()
+
+
+def show_permission_error() -> None:
+    ctypes.windll.user32.MessageBoxW(
+        None,
+        "没有权限：未检测到授权安装目录 ZYRROOY。\n\n请使用安装包重新安装软件。",
+        APP_NAME,
+        0x10,
+    )
+
+
+def load_converter_module(converter_path: Path, module_prefix: str) -> Any:
+    """从文件加载转换器，便于开发版和打包版使用同一套入口。"""
+    if not converter_path.is_file():
+        raise FileNotFoundError(f"未找到模板转换模块：{converter_path}")
+    module_name = f"{module_prefix}_{abs(hash(str(converter_path.resolve())))}"
+    spec = importlib.util.spec_from_file_location(module_name, converter_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载模板转换模块：{converter_path.name}")
+    converter = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = converter
+    spec.loader.exec_module(converter)
+    return converter
+
+
+def select_converter(template_path: Path) -> tuple[Any, str]:
+    """加载基础数据管制表转换器。"""
+    return load_converter_module(CONVERTER_PATH, "bom_to_control_table_gui"), "基础数据管制表模板"
 
 
 class GuiRunLog:
@@ -357,8 +413,6 @@ class GuiWorker(threading.Thread):
         output_path = Path(payload["output_path"]).resolve()
         if self._cancel_requested():
             return {"cancelled": True}
-        if not CONVERTER_PATH.is_file():
-            raise FileNotFoundError(f"未找到模板转换模块：{CONVERTER_PATH}")
         if not bom_paths:
             raise ValueError("请至少添加一份 CATIA BOM 图片清单。")
         missing = [str(path) for path in bom_paths if not path.is_file()]
@@ -370,12 +424,8 @@ class GuiWorker(threading.Thread):
 
         self._progress(1, f"准备合并 {len(bom_paths)} 份 BOM")
         self._log("INFO", "", "待合并 BOM：\n" + "\n".join(str(path) for path in bom_paths))
-        spec = importlib.util.spec_from_file_location("bom_to_control_table_gui", CONVERTER_PATH)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("无法加载模板转换模块。")
-        converter = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = converter
-        spec.loader.exec_module(converter)
+        converter, converter_name = select_converter(template_path)
+        self._log("INFO", "", f"已识别转换规则：{converter_name}")
         try:
             converter.convert_many(
                 bom_paths,
@@ -387,7 +437,7 @@ class GuiWorker(threading.Thread):
         except converter.ConversionCancelled as exc:
             self._log("WARNING", "", str(exc))
             return {"cancelled": True, "output_dir": str(output_path.parent)}
-        self._log("INFO", "", f"已将 {len(bom_paths)} 份 BOM 合并写入同一模板。")
+        self._log("INFO", "", f"已将 {len(bom_paths)} 份 BOM 合并写入同一模板（{converter_name}）。")
         return {"results": [str(output_path)], "output_dir": str(output_path.parent)}
 
 
@@ -499,7 +549,7 @@ class BomManagerApp(tk.Tk):
         auto_frame = ttk.LabelFrame(tab, text="导出后自动转换", padding=10)
         auto_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         auto_frame.columnconfigure(1, weight=1)
-        self._add_path_row(auto_frame, 0, "管制表模板", self.template_file, self._choose_template_file)
+        self._add_path_row(auto_frame, 0, "客户模板", self.template_file, self._choose_template_file)
         self._add_path_row(auto_frame, 1, "转换结果（可留空）", self.auto_convert_output, self._choose_auto_convert_output)
         ttk.Label(
             auto_frame,
@@ -528,7 +578,7 @@ class BomManagerApp(tk.Tk):
         tab.rowconfigure(1, weight=1)
         ttk.Label(
             tab,
-            text="可将 1 份或多份 CATIA 图片清单合并写入同一份基础数据管制表模板；每个总成会保留独立层级、图片与重量汇总。",
+            text="可将 1 份或多份 CATIA 图片清单合并写入同一份客户模板；系统会按模板自动选择转换规则。",
             style="Hint.TLabel",
             wraplength=760,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
@@ -550,7 +600,7 @@ class BomManagerApp(tk.Tk):
         self.clear_convert_boms_button = ttk.Button(bom_frame, text="清空列表", command=self._clear_template_boms)
         self.clear_convert_boms_button.grid(row=2, column=2, sticky="ew", padx=(10, 0))
 
-        self._add_path_row(tab, 2, "管制表模板", self.template_file, self._choose_template_file)
+        self._add_path_row(tab, 2, "客户模板", self.template_file, self._choose_template_file)
         self._add_path_row(tab, 3, "合并输出文件", self.template_output, self._choose_template_output)
         button_frame = ttk.Frame(tab)
         button_frame.grid(row=4, column=1, columnspan=2, sticky="e", pady=(18, 0))
@@ -614,7 +664,7 @@ class BomManagerApp(tk.Tk):
                 self.convert_bom_list.insert("end", value)
         if values and not self.template_output.get():
             first_bom = Path(values[0])
-            self.template_output.set(str(first_bom.with_name("合并_基础数据管制表.xlsx")))
+            self.template_output.set(str(first_bom.with_name("合并_客户模板.xlsx")))
 
     def _remove_selected_template_boms(self) -> None:
         selected = list(self.convert_bom_list.curselection())
@@ -627,12 +677,12 @@ class BomManagerApp(tk.Tk):
         self.convert_bom_list.delete(0, "end")
 
     def _choose_template_file(self) -> None:
-        value = filedialog.askopenfilename(title="选择基础数据管制表模板", filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
+        value = filedialog.askopenfilename(title="选择客户模板", filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
         if value:
             self.template_file.set(value)
 
     def _choose_template_output(self) -> None:
-        initial = self.template_output.get() or str(PROJECT_DIR / "模板转化" / "基础数据管制表_结果.xlsx")
+        initial = self.template_output.get() or str(PROJECT_DIR / "模板转化" / "客户模板_结果.xlsx")
         value = filedialog.asksaveasfilename(title="保存转换结果", initialfile=Path(initial).name, initialdir=str(Path(initial).parent), defaultextension=".xlsx", filetypes=[("Excel 工作簿", "*.xlsx")])
         if value:
             self.template_output.set(value)
@@ -640,7 +690,7 @@ class BomManagerApp(tk.Tk):
     def _choose_auto_convert_output(self) -> None:
         export_dir = Path(self.export_directory.get().strip() or DEFAULT_EXPORT_DIR)
         current = self.auto_convert_output.get().strip()
-        initial = Path(current) if current else export_dir / "自动转换_基础数据管制表.xlsx"
+        initial = Path(current) if current else export_dir / "自动转换_客户模板.xlsx"
         value = filedialog.asksaveasfilename(
             title="保存自动转换结果",
             initialfile=initial.name,
@@ -820,26 +870,23 @@ def run_packaged_self_check() -> int:
         from PIL import Image  # noqa: F401
 
         load_bom_core()
-        if not CONVERTER_PATH.is_file():
-            raise FileNotFoundError(f"模板转换组件不存在：{CONVERTER_PATH}")
-        spec = importlib.util.spec_from_file_location("bom_to_control_table_self_check", CONVERTER_PATH)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("无法加载模板转换组件。")
-        converter = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = converter
-        spec.loader.exec_module(converter)
+        load_converter_module(CONVERTER_PATH, "bom_to_control_table_self_check")
         return 0
     except Exception:
         traceback.print_exc()
         return 1
 
 
-def main() -> None:
+def main() -> int:
+    if not has_installation_permission():
+        show_permission_error()
+        return 1
     if "--self-check" in sys.argv:
-        raise SystemExit(run_packaged_self_check())
+        return run_packaged_self_check()
     app = BomManagerApp()
     app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

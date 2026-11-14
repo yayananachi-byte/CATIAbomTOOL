@@ -21,7 +21,8 @@ hidden_imports = [
 
 a = Analysis(
     [str(gui_entry)],
-    pathex=[str(project_root)],
+    # GUI 内核优先，避免打包到仓库根目录的兼容入口。
+    pathex=[str(project_root / "CATIA_BOM_GUI"), str(project_root)],
     binaries=[],
     datas=[
         (str(converter), "模板转化"),

@@ -24,12 +24,14 @@ from catia_bom_export_v2 import (
     LOG_DIR,
     BomExportError,
     RunLog,
+    ScreenshotDisplayState,
     add_image,
     capture_assembly_image,
     capture_part_image,
     clean_filename,
     com_text,
     connect_catia,
+    configure_sheet,
     create_bom_items,
     get_active_product_document,
     hide_stale_measurement_geometry,
@@ -49,9 +51,12 @@ def _style(cell, font, fill, alignment, border) -> None:
 
 
 def write_image_index(nodes, items, output: Path, root_name: str, log: RunLog) -> None:
+    problem_nodes = [node for node in nodes if node.is_leaf and node.part_doc is None]
+    main_nodes = [node for node in nodes if not (node.is_leaf and node.part_doc is None)]
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "产品结构"
+    problem_sheet = workbook.create_sheet("问题数据清单")
 
     thin = Side(style="thin", color="B7C9D6")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -89,7 +94,7 @@ def write_image_index(nodes, items, output: Path, root_name: str, log: RunLog) -
     item_by_key = dict(items)
     assembly_fill = PatternFill("solid", fgColor="D9EAF7")
     root_fill = PatternFill("solid", fgColor="9DC3E6")
-    for row, node in enumerate(nodes, 3):
+    for row, node in enumerate(main_nodes, 3):
         item = item_by_key.get(node.unique_key) if node.is_leaf else None
         image_path = item.image_path if item else node.image_path
         image_status = item.image_status if item else node.image_status
@@ -158,15 +163,35 @@ def write_image_index(nodes, items, output: Path, root_name: str, log: RunLog) -
         else:
             sheet.row_dimensions[row].height = 24
 
-    if nodes:
-        sheet.auto_filter.ref = f"A2:{last_column}{len(nodes) + 2}"
+    if main_nodes:
+        sheet.auto_filter.ref = f"A2:{last_column}{len(main_nodes) + 2}"
     sheet.freeze_panes = "A3"
+
+    problem_border, problem_font, _ = configure_sheet(
+        problem_sheet,
+        ["树编号", "层级", "零件号", "零件名称", "实例名称", "父级路径", "本级数量", "问题原因"],
+        f"问题数据清单：{root_name}（{len(problem_nodes)} 条）",
+        [14, 8, 36, 30, 34, 56, 14, 48],
+    )
+    problem_fill = PatternFill("solid", fgColor="FCE4D6")
+    for row, node in enumerate(problem_nodes, 3):
+        values = (
+            node.tree_number, node.level, node.part_number, node.nomenclature,
+            node.instance_name, node.parent_path, node.tree_quantity,
+            "未找到或无法读取 CATPart 文档",
+        )
+        for column, value in enumerate(values, 1):
+            _style(problem_sheet.cell(row, column, value), problem_font, problem_fill, left, problem_border)
+        problem_sheet.row_dimensions[row].height = 24
+    if problem_nodes:
+        problem_sheet.auto_filter.ref = f"A2:H{len(problem_nodes) + 2}"
 
     workbook.save(output)
 
 
 def main() -> None:
     log = RunLog()
+    screenshot_display = None
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     started = time.time()
     try:
@@ -178,7 +203,7 @@ def main() -> None:
         log.info("遍历产品树", root_name)
         nodes = traverse_product_tree(catia, root_product, log)
         items = create_bom_items(nodes)
-        if not items:
+        if not any(node.is_leaf for node in nodes):
             raise BomExportError("产品树中没有可截图的叶子零件。")
 
         log.info("读取属性 Material 与 PartBody Material")
@@ -194,14 +219,17 @@ def main() -> None:
         for item in items.values():
             if item.representative.part_doc is not None:
                 hide_stale_measurement_geometry(item.representative.part_doc, log, item.part_number)
+        product_doc.Activate()
+        screenshot_display = ScreenshotDisplayState(catia, product_doc, nodes, log)
+        screenshot_display.prepare()
         assembly_nodes = [node for node in nodes if not node.is_leaf]
         log.info(f"共找到 {len(assembly_nodes)} 个总成节点、{len(items)} 种唯一零件；开始截图")
         for index, node in enumerate(assembly_nodes, 1):
             log.info("生成总成截图", f"{index}/{len(assembly_nodes)} {node.tree_number} {node.part_number}")
-            capture_assembly_image(catia, node, product_doc, log)
+            capture_assembly_image(catia, node, product_doc, log, screenshot_display)
         for index, item in enumerate(items.values(), 1):
             log.info("生成唯一件截图", f"{index}/{len(items)} {item.part_number}")
-            capture_part_image(catia, item, product_doc, log)
+            capture_part_image(catia, item, product_doc, log, screenshot_display)
 
         output = BOM_OUTPUT_DIR / f"CATIA_图片清单_{clean_filename(root_name)}_{timestamp}.xlsx"
         write_image_index(nodes, items, output, root_name, log)
@@ -216,6 +244,8 @@ def main() -> None:
         log.error(f"未处理异常：{exc}")
         traceback.print_exc()
     finally:
+        if screenshot_display is not None:
+            screenshot_display.restore()
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_path = LOG_DIR / f"CATIA_图片日志_{timestamp}.txt"
         log.save(log_path)
