@@ -12,6 +12,7 @@ version_file = installer_root / "version_info_app.txt"
 
 hidden_imports = [
     "catia_bom_export_v2",
+    "gwm_properties",
     "pythoncom",
     "pywintypes",
     "win32com.client",

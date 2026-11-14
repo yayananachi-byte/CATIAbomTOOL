@@ -2842,6 +2842,7 @@ def export_product_document(
     image_directory: Optional[Path] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
     cancel_requested: Optional[Callable[[], bool]] = None,
+    data_type: str = "standard",
 ) -> str:
     """导出一个已经打开的 CATProduct；绝不调用 Save 或 SaveAs。
 
@@ -2865,6 +2866,19 @@ def export_product_document(
         root_name = com_text(root_product.PartNumber) or com_text(product_doc.Name)
         log.info("遍历产品树", root_name)
         nodes = traverse_product_tree(catia, root_product, log)
+        if data_type == "gwm":
+            from gwm_properties import read_properties
+            gwm_values = {}
+            for node in nodes:
+                details = read_properties(node.product)
+                # 总成、分总成和零件都使用本节点引用产品的 V_description。
+                # 引用属性为空时，保留 CATIA 原有名称。
+                node.nomenclature = details["name"] or node.nomenclature
+                node.revision = details["revision"] or node.revision
+                if node.is_leaf and node.part_doc is not None:
+                    gwm_values[node.part_number] = details
+        elif data_type != "standard":
+            raise ValueError(f"未知数据类型：{data_type}")
         items = create_bom_items(nodes)
         _emit_export_progress(progress_callback, 8, f"已读取产品树：{len(items)} 种唯一零件")
         _check_export_cancel(cancel_requested)
@@ -2874,20 +2888,49 @@ def export_product_document(
             raise BomExportError("产品树没有可导出的叶子零件。")
 
         # 完整图片清单：转换基础数据管制表所需的材质、厚度、质量、包络和图片。
-        log.info("读取属性 Material 与 PartBody Material")
-        populate_materials(items, log)
+        if data_type == "gwm":
+            for item in items.values():
+                details = gwm_values[item.part_number]
+                material = details["material"]
+                item.material = MaterialInfo(material, "", "长城产品属性" if material else "属性缺失")
+                thickness = details["thickness_mm"]
+                item.nominal_thickness = NominalThicknessInfo(
+                    f"{thickness:g} mm" if thickness is not None else "",
+                    details["thickness_note"],
+                    "已识别" if thickness is not None else "未识别",
+                )
+                weight = details["weight_kg"]
+                item.mass = MassResult(
+                    value_kg=weight,
+                    source=details["weight_note"] if weight is not None else "长城属性未提供有效重量或单位",
+                    status="成功" if weight is not None else "未识别",
+                )
+                dimensions = details["dimensions"]
+                item.dimensions = DimensionResult(
+                    *(dimensions or (None, None, None)),
+                    source="E_XParamStr3DLWH（产品属性）",
+                    status="成功" if dimensions else "属性缺失或格式无效",
+                )
+                if not thickness:
+                    log.warning(details["thickness_note"], item.part_number)
+        else:
+            log.info("读取属性 Material 与 PartBody Material")
+            populate_materials(items, log)
         _emit_export_progress(progress_callback, 16, "材质读取完成")
         _check_export_cancel(cancel_requested)
         log.info("读取名义厚度")
-        populate_nominal_thicknesses(items, log)
+        if data_type == "standard":
+            populate_nominal_thicknesses(items, log)
         _emit_export_progress(progress_callback, 24, "厚度读取完成")
         _check_export_cancel(cancel_requested)
         log.info("测量单件质量")
-        populate_masses(items, product_doc, log)
+        if data_type == "standard":
+            populate_masses(items, product_doc, log)
         _emit_export_progress(progress_callback, 34, "质量测量完成")
         _check_export_cancel(cancel_requested)
         log.info("测量包装包络")
-        populate_rough_stock_dimensions(items, product_doc, log)
+        if data_type == "standard":
+            populate_rough_stock_dimensions(items, product_doc, log)
         _emit_export_progress(progress_callback, 48, "包络尺寸测量完成")
         _check_export_cancel(cancel_requested)
 

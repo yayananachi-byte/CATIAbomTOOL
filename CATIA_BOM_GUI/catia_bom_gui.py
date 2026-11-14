@@ -230,6 +230,7 @@ class GuiWorker(threading.Thread):
         output_dir = Path(payload["output_dir"]).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         mode = payload["mode"]
+        data_type = payload.get("data_type", "standard")
         product_paths = [Path(value).resolve() for value in payload.get("products", [])]
         timestamp = self._timestamp()
         log = self._create_log()
@@ -258,6 +259,7 @@ class GuiWorker(threading.Thread):
                         image_dir,
                         self._progress,
                         self._cancel_requested,
+                        data_type,
                     )
                     results.append(str(output))
                 except core.ExportCancelled as exc:
@@ -301,6 +303,7 @@ class GuiWorker(threading.Thread):
                             image_dir,
                             item_progress,
                             self._cancel_requested,
+                            data_type,
                         )
                         results.append(str(output))
                         item_log.info("任务完成", str(output))
@@ -458,6 +461,7 @@ class BomManagerApp(tk.Tk):
         self.last_output_dir: Optional[Path] = None
 
         self.export_mode = tk.StringVar(value="active")
+        self.data_type = tk.StringVar(value="standard")
         self.export_directory = tk.StringVar(value=str(DEFAULT_EXPORT_DIR))
         self.template_bom_paths: list[str] = []
         self.template_file = tk.StringVar(value=DEFAULT_TEMPLATE_PATH)
@@ -526,12 +530,17 @@ class BomManagerApp(tk.Tk):
         modes.grid(row=0, column=1, columnspan=2, sticky="w", pady=6)
         ttk.Radiobutton(modes, text="当前 CATIA 活动总成", variable=self.export_mode, value="active", command=self._refresh_mode).pack(side="left")
         ttk.Radiobutton(modes, text="多个 CATProduct 批量导出", variable=self.export_mode, value="batch", command=self._refresh_mode).pack(side="left", padx=(20, 0))
-        self._add_path_row(tab, 1, "导出目录", self.export_directory, self._choose_export_directory)
+        ttk.Label(tab, text="数据类型").grid(row=1, column=0, sticky="w", pady=6)
+        data_types = ttk.Frame(tab)
+        data_types.grid(row=1, column=1, columnspan=2, sticky="w", pady=6)
+        ttk.Radiobutton(data_types, text="普通数据", variable=self.data_type, value="standard").pack(side="left")
+        ttk.Radiobutton(data_types, text="长城数据（读取产品属性）", variable=self.data_type, value="gwm").pack(side="left", padx=(20, 0))
+        self._add_path_row(tab, 2, "导出目录", self.export_directory, self._choose_export_directory)
 
-        ttk.Label(tab, text="批量任务").grid(row=2, column=0, sticky="nw", pady=(12, 6))
+        ttk.Label(tab, text="批量任务").grid(row=3, column=0, sticky="nw", pady=(12, 6))
         task_frame = ttk.Frame(tab)
-        task_frame.grid(row=2, column=1, columnspan=2, sticky="nsew", pady=(12, 6))
-        tab.rowconfigure(2, weight=1)
+        task_frame.grid(row=3, column=1, columnspan=2, sticky="nsew", pady=(12, 6))
+        tab.rowconfigure(3, weight=1)
         task_frame.columnconfigure(0, weight=1)
         self.product_list = tk.Listbox(task_frame, height=11, selectmode="extended", activestyle="none")
         self.product_list.grid(row=0, column=0, rowspan=4, sticky="nsew")
@@ -547,7 +556,7 @@ class BomManagerApp(tk.Tk):
         ttk.Label(task_frame, text="批量模式将依次打开、导出并关闭文件，不保存客户源文件。", style="Hint.TLabel", wraplength=220).grid(row=3, column=2, sticky="sw", padx=(10, 0))
 
         auto_frame = ttk.LabelFrame(tab, text="导出后自动转换", padding=10)
-        auto_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        auto_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         auto_frame.columnconfigure(1, weight=1)
         self._add_path_row(auto_frame, 0, "客户模板", self.template_file, self._choose_template_file)
         self._add_path_row(auto_frame, 1, "转换结果（可留空）", self.auto_convert_output, self._choose_auto_convert_output)
@@ -559,7 +568,7 @@ class BomManagerApp(tk.Tk):
         ).grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(2, 0))
 
         button_frame = ttk.Frame(tab)
-        button_frame.grid(row=4, column=1, columnspan=2, sticky="e", pady=(16, 0))
+        button_frame.grid(row=5, column=1, columnspan=2, sticky="e", pady=(16, 0))
         self.export_and_convert_button = ttk.Button(
             button_frame,
             text="一键导出并转换",
@@ -730,7 +739,7 @@ class BomManagerApp(tk.Tk):
         if self.export_mode.get() == "batch" and not self.product_paths:
             messagebox.showwarning("缺少任务", "批量模式请至少添加一个 CATProduct。")
             return None
-        return {"mode": self.export_mode.get(), "output_dir": directory, "products": list(self.product_paths)}
+        return {"mode": self.export_mode.get(), "data_type": self.data_type.get(), "output_dir": directory, "products": list(self.product_paths)}
 
     def _start_export_and_conversion(self) -> None:
         export_payload = self._get_export_payload()
