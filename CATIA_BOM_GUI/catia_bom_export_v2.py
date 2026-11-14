@@ -2877,6 +2877,10 @@ def export_product_document(
                 node.revision = details["revision"] or node.revision
                 if node.is_leaf and node.part_doc is not None:
                     gwm_values[node.part_number] = details
+        elif data_type == "geely":
+            from geely_data import part_name_without_version
+            for node in nodes:
+                node.nomenclature = part_name_without_version(node.nomenclature)
         elif data_type != "standard":
             raise ValueError(f"未知数据类型：{data_type}")
         items = create_bom_items(nodes)
@@ -2919,17 +2923,17 @@ def export_product_document(
         _emit_export_progress(progress_callback, 16, "材质读取完成")
         _check_export_cancel(cancel_requested)
         log.info("读取名义厚度")
-        if data_type == "standard":
+        if data_type != "gwm":
             populate_nominal_thicknesses(items, log)
         _emit_export_progress(progress_callback, 24, "厚度读取完成")
         _check_export_cancel(cancel_requested)
         log.info("测量单件质量")
-        if data_type == "standard":
+        if data_type != "gwm":
             populate_masses(items, product_doc, log)
         _emit_export_progress(progress_callback, 34, "质量测量完成")
         _check_export_cancel(cancel_requested)
         log.info("测量包装包络")
-        if data_type == "standard":
+        if data_type != "gwm":
             populate_rough_stock_dimensions(items, product_doc, log)
         _emit_export_progress(progress_callback, 48, "包络尺寸测量完成")
         _check_export_cancel(cancel_requested)

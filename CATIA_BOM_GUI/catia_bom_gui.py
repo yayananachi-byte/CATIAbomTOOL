@@ -535,6 +535,7 @@ class BomManagerApp(tk.Tk):
         data_types.grid(row=1, column=1, columnspan=2, sticky="w", pady=6)
         ttk.Radiobutton(data_types, text="普通数据", variable=self.data_type, value="standard").pack(side="left")
         ttk.Radiobutton(data_types, text="长城数据（读取产品属性）", variable=self.data_type, value="gwm").pack(side="left", padx=(20, 0))
+        ttk.Radiobutton(data_types, text="吉利数据（各层级名称去版本）", variable=self.data_type, value="geely").pack(side="left", padx=(20, 0))
         self._add_path_row(tab, 2, "导出目录", self.export_directory, self._choose_export_directory)
 
         ttk.Label(tab, text="批量任务").grid(row=3, column=0, sticky="nw", pady=(12, 6))
