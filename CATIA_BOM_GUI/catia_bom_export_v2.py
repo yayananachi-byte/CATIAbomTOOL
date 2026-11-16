@@ -280,7 +280,11 @@ def get_nomenclature(product: Any) -> str:
     return ""
 
 
-def get_part_document(product: Any, catia: Any) -> Optional[Any]:
+def get_part_document(
+    product: Any,
+    catia: Any,
+    document_index: Optional[Callable[[], dict[str, Any]]] = None,
+) -> Optional[Any]:
     """优先从 ReferenceProduct 取得真实 CATPart 文档，不依赖文件名匹配。"""
     candidates: list[Any] = []
     for candidate_product in (product, _reference_product(product)):
@@ -300,11 +304,14 @@ def get_part_document(product: Any, catia: Any) -> Optional[Any]:
 
     # 部分 CATIA 配置下 ReferenceProduct.Parent 不返回 Document，最后扫描已打开文档。
     try:
+        part_number = com_text(product.PartNumber)
+        if document_index is not None:
+            return document_index().get(part_number)
         for index in range(1, catia.Documents.Count + 1):
             document = catia.Documents.Item(index)
             if not com_text(document.Name).lower().endswith(".catpart"):
                 continue
-            if com_text(document.Product.PartNumber) == com_text(product.PartNumber):
+            if com_text(document.Product.PartNumber) == part_number:
                 return document
     except Exception:
         pass
@@ -350,6 +357,30 @@ def is_leaf(product: Any) -> bool:
 
 def traverse_product_tree(catia: Any, root: Any, log: RunLog) -> list[TreeNode]:
     nodes: list[TreeNode] = []
+    # 缓存只在本次遍历有效，避免关闭/切换总成后继续持有上一批的 COM 对象。
+    part_documents: dict[str, Optional[Any]] = {}
+    fallback_documents: Optional[dict[str, Any]] = None
+
+    def document_index() -> dict[str, Any]:
+        nonlocal fallback_documents
+        if fallback_documents is None:
+            fallback_documents = {}
+            documents = catia.Documents
+            for index in range(1, documents.Count + 1):
+                try:
+                    document = documents.Item(index)
+                    if com_text(document.Name).lower().endswith(".catpart"):
+                        fallback_documents.setdefault(com_text(document.Product.PartNumber), document)
+                except Exception:
+                    continue
+        return fallback_documents
+
+    def resolve_part_document(product: Any) -> Optional[Any]:
+        # 按实例缓存，而非按零件号缓存，保留同号损坏实例的独立问题记录。
+        key = _com_object_identity(product)
+        if key not in part_documents:
+            part_documents[key] = get_part_document(product, catia, document_index)
+        return part_documents[key]
 
     def identity(product: Any, fallback: str) -> tuple[str, str, bool]:
         """损坏的引用可能无法读取 PartNumber，仍保留其实例和子树。"""
@@ -376,7 +407,7 @@ def traverse_product_tree(catia: Any, root: Any, log: RunLog) -> list[TreeNode]:
             child_count = 0
             log.warning(f"无法读取子节点数量，该节点下的内容可能不完整：{exc}", full_path)
         leaf = child_count == 0
-        part_doc = get_part_document(product, catia) if leaf else None
+        part_doc = resolve_part_document(product) if leaf else None
         node = TreeNode(
             level=level,
             tree_number=sequence,
@@ -412,8 +443,8 @@ def traverse_product_tree(catia: Any, root: Any, log: RunLog) -> list[TreeNode]:
                     prior_index = seen_leaf_parts[child_number]
                     prior_child, occurrences = display_children[prior_index]
                     if prior_index not in valid_leaf_groups:
-                        valid_leaf_groups[prior_index] = get_part_document(prior_child, catia) is not None
-                    current_valid = get_part_document(child, catia) is not None
+                        valid_leaf_groups[prior_index] = resolve_part_document(prior_child) is not None
+                    current_valid = resolve_part_document(child) is not None
                     if valid_leaf_groups[prior_index] and current_valid:
                         occurrences.append(child)
                         display_children[prior_index] = (prior_child, occurrences)
@@ -2139,6 +2170,8 @@ class ScreenshotDisplayState:
     window: Optional[Any] = field(default=None, init=False, repr=False)
     window_layout: Optional[Any] = field(default=None, init=False, repr=False)
     capture_artifacts: list[tuple[Any, Any, str, frozenset[str]]] = field(default_factory=list, init=False, repr=False)
+    artifact_indices_by_owner: dict[str, list[int]] = field(default_factory=dict, init=False, repr=False)
+    global_artifact_indices: list[int] = field(default_factory=list, init=False, repr=False)
     artifact_states: list[tuple[Any, Any, int, str]] = field(default_factory=list, init=False, repr=False)
     artifact_state_keys: set[str] = field(default_factory=set, init=False, repr=False)
     artifact_log_written: bool = field(default=False, init=False, repr=False)
@@ -2274,9 +2307,8 @@ class ScreenshotDisplayState:
 
         self.product_doc.Activate()
         desired = {_com_object_identity(product): product for product in target_products}
-        all_keys = {_com_object_identity(product) for product in self.all_leaf_products}
-
         if not self.visibility_initialized:
+            all_keys = {_com_object_identity(product) for product in self.all_leaf_products}
             # 截图顺序通常从根总成开始；此时直接批量显示即可，省去一次无意义的全隐藏。
             if set(desired) == all_keys:
                 _set_leaf_products_visibility(self.product_doc, target_products, show=True)
@@ -2299,11 +2331,13 @@ class ScreenshotDisplayState:
     def hide_capture_artifacts(self, visible_products: list[Any]) -> None:
         """仅隐藏本张图涉及零件的辅助对象，并按文档批量切换显示状态。"""
         visible_keys = {_com_object_identity(product) for product in visible_products}
+        relevant_indices = set(self.global_artifact_indices)
+        for key in visible_keys:
+            relevant_indices.update(self.artifact_indices_by_owner.get(key, ()))
         hidden_count = 0
         by_document: dict[str, tuple[Any, list[Any]]] = {}
-        for document, artifact, label, owner_keys in self.capture_artifacts:
-            if owner_keys and not owner_keys.intersection(visible_keys):
-                continue
+        for index in sorted(relevant_indices):
+            document, artifact, label, _owner_keys = self.capture_artifacts[index]
             key = f"{_com_object_identity(document)}::{_com_object_identity(artifact)}"
             selection = None
             try:
@@ -2396,6 +2430,13 @@ class ScreenshotDisplayState:
             self.log.info("截图期间未发现已显示的 PMI/标注集")
 
         self.capture_artifacts = self._collect_capture_artifacts()
+        self.artifact_indices_by_owner.clear()
+        self.global_artifact_indices.clear()
+        for index, (_document, _artifact, _label, owner_keys) in enumerate(self.capture_artifacts):
+            if not owner_keys:
+                self.global_artifact_indices.append(index)
+            for owner in owner_keys:
+                self.artifact_indices_by_owner.setdefault(owner, []).append(index)
 
         try:
             self.catia.ActiveWindow.ActiveViewer.Update()
@@ -2484,7 +2525,9 @@ def capture_node_image(
     image_path = IMAGE_DIR / f"{image_stem}.png"
     try:
         # 先隐藏此前运行尺寸脚本可能留下的辅助线，避免 Reframe 把零件缩成小点。
-        if part_doc is not None:
+        if part_doc is not None and (screenshot_display is None or not screenshot_display.prepared):
+            # 已准备的截图会话在开始前统一清理过；截图期间不生成测量几何，
+            # 无需每张图切换到 CATPart 再重复清理一次。
             part_doc.Activate()
             hide_stale_measurement_geometry(part_doc, log, label)
 
@@ -2869,14 +2912,16 @@ def export_product_document(
         if data_type == "gwm":
             from gwm_properties import read_properties
             gwm_values = {}
+            reference_cache = {}
             for node in nodes:
-                details = read_properties(node.product)
+                _check_export_cancel(cancel_requested)
+                details = read_properties(node.product, reference_cache, identity_only=not node.is_leaf)
                 # 总成、分总成和零件都使用本节点引用产品的 V_description。
                 # 引用属性为空时，保留 CATIA 原有名称。
                 node.nomenclature = details["name"] or node.nomenclature
                 node.revision = details["revision"] or node.revision
                 if node.is_leaf and node.part_doc is not None:
-                    gwm_values[node.part_number] = details
+                    gwm_values[id(node)] = details
         elif data_type == "geely":
             from geely_data import part_name_without_version
             for node in nodes:
@@ -2894,7 +2939,7 @@ def export_product_document(
         # 完整图片清单：转换基础数据管制表所需的材质、厚度、质量、包络和图片。
         if data_type == "gwm":
             for item in items.values():
-                details = gwm_values[item.part_number]
+                details = gwm_values[id(item.representative)]
                 material = details["material"]
                 item.material = MaterialInfo(material, "", "长城产品属性" if material else "属性缺失")
                 thickness = details["thickness_mm"]

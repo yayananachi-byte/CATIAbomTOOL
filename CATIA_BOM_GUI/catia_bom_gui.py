@@ -878,6 +878,8 @@ def run_packaged_self_check() -> int:
         import openpyxl  # noqa: F401
         import pythoncom  # noqa: F401
         from PIL import Image  # noqa: F401
+        import gwm_properties  # noqa: F401
+        import geely_data  # noqa: F401
 
         load_bom_core()
         load_converter_module(CONVERTER_PATH, "bom_to_control_table_self_check")
