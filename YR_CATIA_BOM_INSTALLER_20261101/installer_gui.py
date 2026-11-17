@@ -199,15 +199,20 @@ def install_application(progress: Callable[[str], None]) -> str:
     copy_application_payload(progress)
 
     progress("正在验证内置 Python、Excel、图片和 CATIA COM 组件")
+    check_log = INSTALL_DIR / "self-check.log"
     check_result = subprocess.run(
-        [str(APP_EXE_PATH), "--self-check"],
+        [str(APP_EXE_PATH), "--self-check", "--self-check-log", str(check_log)],
         cwd=str(INSTALL_DIR),
         timeout=60,
         check=False,
     )
     if check_result.returncode != 0:
+        details = ""
+        if check_log.is_file():
+            details = check_log.read_text(encoding="utf-8", errors="replace").strip()
         raise RuntimeError(
-            f"软件运行组件自检失败（错误码 {check_result.returncode}），请重新下载安装包。"
+            f"软件运行组件自检失败（错误码 {check_result.returncode}）。\n"
+            f"诊断日志：{check_log}\n{details}"
         )
 
     progress("正在写入卸载程序")

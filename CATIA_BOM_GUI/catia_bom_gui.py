@@ -363,10 +363,11 @@ class GuiWorker(threading.Thread):
         else:
             output_dir = Path(export_summary["output_dir"]).resolve()
             timestamp = self._timestamp()
+            suffix = "吉利版基础数据管制表" if export_payload.get("data_type") == "geely" else "基础数据管制表"
             if len(export_results) == 1:
-                name = f"{Path(export_results[0]).stem}_基础数据管制表.xlsx"
+                name = f"{Path(export_results[0]).stem}_{suffix}.xlsx"
             else:
-                name = f"CATIA_BOM_合并_{timestamp}_基础数据管制表.xlsx"
+                name = f"CATIA_BOM_合并_{timestamp}_{suffix}.xlsx"
             output_path = self._available_output_path(output_dir / name)
 
         self._log("INFO", "", f"BOM 导出完成，开始自动转换模板：{output_path}")
@@ -378,6 +379,7 @@ class GuiWorker(threading.Thread):
                     "bom_paths": export_results,
                     "template_path": str(template_path),
                     "output_path": str(output_path),
+                    "data_type": export_payload.get("data_type", "standard"),
                 }
             )
         except Exception as exc:
@@ -428,6 +430,9 @@ class GuiWorker(threading.Thread):
         self._progress(1, f"准备合并 {len(bom_paths)} 份 BOM")
         self._log("INFO", "", "待合并 BOM：\n" + "\n".join(str(path) for path in bom_paths))
         converter, converter_name = select_converter(template_path)
+        geely_mode = payload.get("data_type") == "geely"
+        if geely_mode:
+            converter_name = "吉利版基础数据管制表模板"
         self._log("INFO", "", f"已识别转换规则：{converter_name}")
         try:
             converter.convert_many(
@@ -436,6 +441,7 @@ class GuiWorker(threading.Thread):
                 output_path,
                 progress_callback=self._progress,
                 cancel_requested=self._cancel_requested,
+                geely_mode=geely_mode,
             )
         except converter.ConversionCancelled as exc:
             self._log("WARNING", "", str(exc))
@@ -464,6 +470,7 @@ class BomManagerApp(tk.Tk):
         self.data_type = tk.StringVar(value="standard")
         self.export_directory = tk.StringVar(value=str(DEFAULT_EXPORT_DIR))
         self.template_bom_paths: list[str] = []
+        self.conversion_type = tk.StringVar(value="standard")
         self.template_file = tk.StringVar(value=DEFAULT_TEMPLATE_PATH)
         self.template_output = tk.StringVar()
         self.auto_convert_output = tk.StringVar()
@@ -585,17 +592,23 @@ class BomManagerApp(tk.Tk):
     def _build_convert_tab(self) -> None:
         tab = self.convert_tab
         tab.columnconfigure(1, weight=1)
-        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(2, weight=1)
         ttk.Label(
             tab,
-            text="可将 1 份或多份 CATIA 图片清单合并写入同一份客户模板；系统会按模板自动选择转换规则。",
+            text="可独立转换已有的 BOM，无需连接 CATIA。吉利版将原表名称按层级填入总成号、分总成号或零件号，模板名称列留空。",
             style="Hint.TLabel",
             wraplength=760,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
-        ttk.Label(tab, text="待合并 BOM").grid(row=1, column=0, sticky="nw", pady=6)
+        ttk.Label(tab, text="转换版本").grid(row=1, column=0, sticky="w", pady=6)
+        versions = ttk.Frame(tab)
+        versions.grid(row=1, column=1, columnspan=2, sticky="w", pady=6)
+        ttk.Radiobutton(versions, text="普通版模板转化", variable=self.conversion_type, value="standard").pack(side="left")
+        ttk.Radiobutton(versions, text="吉利版模板转化", variable=self.conversion_type, value="geely").pack(side="left", padx=(20, 0))
+
+        ttk.Label(tab, text="待合并 BOM").grid(row=2, column=0, sticky="nw", pady=6)
         bom_frame = ttk.Frame(tab)
-        bom_frame.grid(row=1, column=1, columnspan=2, sticky="nsew", pady=6)
+        bom_frame.grid(row=2, column=1, columnspan=2, sticky="nsew", pady=6)
         bom_frame.columnconfigure(0, weight=1)
         bom_frame.rowconfigure(0, weight=1)
         self.convert_bom_list = tk.Listbox(bom_frame, height=8, selectmode="extended", activestyle="none")
@@ -610,10 +623,10 @@ class BomManagerApp(tk.Tk):
         self.clear_convert_boms_button = ttk.Button(bom_frame, text="清空列表", command=self._clear_template_boms)
         self.clear_convert_boms_button.grid(row=2, column=2, sticky="ew", padx=(10, 0))
 
-        self._add_path_row(tab, 2, "客户模板", self.template_file, self._choose_template_file)
-        self._add_path_row(tab, 3, "合并输出文件", self.template_output, self._choose_template_output)
+        self._add_path_row(tab, 3, "客户模板", self.template_file, self._choose_template_file)
+        self._add_path_row(tab, 4, "合并输出文件", self.template_output, self._choose_template_output)
         button_frame = ttk.Frame(tab)
-        button_frame.grid(row=4, column=1, columnspan=2, sticky="e", pady=(18, 0))
+        button_frame.grid(row=5, column=1, columnspan=2, sticky="e", pady=(18, 0))
         self.convert_button = ttk.Button(button_frame, text="合并转换为一份模板", style="Accent.TButton", command=self._start_conversion)
         self.convert_button.pack(side="right")
 
@@ -764,6 +777,7 @@ class BomManagerApp(tk.Tk):
             "bom_paths": list(self.template_bom_paths),
             "template_path": self.template_file.get().strip(),
             "output_path": self.template_output.get().strip(),
+            "data_type": self.conversion_type.get(),
         }
         if not values["bom_paths"] or not values["template_path"] or not values["output_path"]:
             messagebox.showwarning("文件未选择", "请至少添加一份 BOM，并选择模板和输出文件。")
@@ -872,7 +886,7 @@ class BomManagerApp(tk.Tk):
         self.destroy()
 
 
-def run_packaged_self_check() -> int:
+def run_packaged_self_check(log_path: Optional[Path] = None) -> int:
     """Validate bundled runtime components without connecting to or changing CATIA."""
     try:
         import openpyxl  # noqa: F401
@@ -883,9 +897,18 @@ def run_packaged_self_check() -> int:
 
         load_bom_core()
         load_converter_module(CONVERTER_PATH, "bom_to_control_table_self_check")
+        if log_path is not None:
+            log_path.write_text("运行组件自检通过。\n", encoding="utf-8")
         return 0
     except Exception:
-        traceback.print_exc()
+        details = traceback.format_exc()
+        if log_path is not None:
+            try:
+                log_path.write_text(details, encoding="utf-8")
+            except OSError:
+                pass
+        if sys.stderr is not None:
+            sys.stderr.write(details)
         return 1
 
 
@@ -894,7 +917,12 @@ def main() -> int:
         show_permission_error()
         return 1
     if "--self-check" in sys.argv:
-        return run_packaged_self_check()
+        log_path = None
+        if "--self-check-log" in sys.argv:
+            index = sys.argv.index("--self-check-log")
+            if index + 1 < len(sys.argv):
+                log_path = Path(sys.argv[index + 1])
+        return run_packaged_self_check(log_path)
     app = BomManagerApp()
     app.mainloop()
     return 0

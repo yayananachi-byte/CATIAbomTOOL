@@ -23,6 +23,32 @@ try {
     & $buildPython -m PyInstaller --noconfirm --clean $appSpec
     if ($LASTEXITCODE -ne 0) { throw 'Application build failed.' }
 
+    Write-Host 'Checking the packaged application runtime...'
+    $appBundle = Join-Path $installerRoot 'dist\YR_CATIA_BOM_Manager'
+    $appExe = Join-Path $appBundle 'YR_CATIA_BOM_Manager.exe'
+    $checkLog = Join-Path $installerRoot 'build\packaged-self-check.log'
+    $checkMarker = Join-Path $appBundle 'ZYRROOY'
+    $createdMarker = -not (Test-Path -LiteralPath $checkMarker)
+    try {
+        if ($createdMarker) { New-Item -ItemType Directory -Path $checkMarker | Out-Null }
+        $checkProcess = Start-Process -FilePath $appExe -ArgumentList @('--self-check', '--self-check-log', ('"' + $checkLog + '"')) -WorkingDirectory $appBundle -WindowStyle Hidden -PassThru
+        if (-not $checkProcess.WaitForExit(60000)) {
+            $checkProcess.Kill()
+            throw 'Packaged application self-check timed out.'
+        }
+        $checkProcess.Refresh()
+        if ($checkProcess.ExitCode -ne 0) {
+            $details = if (Test-Path -LiteralPath $checkLog) { Get-Content -LiteralPath $checkLog -Raw } else { 'No diagnostic log was produced.' }
+            throw "Packaged application self-check failed: $details"
+        }
+    }
+    finally {
+        # 仅移除本次创建的空授权标记；不将它打包进安装载荷。
+        if ($createdMarker -and (Test-Path -LiteralPath $checkMarker)) {
+            [IO.Directory]::Delete($checkMarker, $false)
+        }
+    }
+
     Write-Host 'Building the single-file offline installer...'
     & $buildPython -m PyInstaller --noconfirm --clean $setupSpec
     if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }

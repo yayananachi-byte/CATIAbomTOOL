@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 from copy import copy
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 import openpyxl
+from PIL import Image, ImageDraw
 from openpyxl.cell.cell import MergedCell
 from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.formula.translate import Translator
@@ -35,6 +37,9 @@ from openpyxl.worksheet.cell_range import CellRange
 DATA_START_ROW = 10
 ROWS_PER_RECORD = 6
 PRODUCT_LAST_COL = 40  # AN
+TEMPLATE_IMAGE_CM = 8.57
+TEMPLATE_IMAGE_PX = round(TEMPLATE_IMAGE_CM * 96 / 2.54)
+IMAGE_MARGIN = 0.10
 HIERARCHY_COLUMNS = ("D", "E", "F", "G", "H", "I", "J")
 
 # 汽车常见标准件。名称命中这些词（中英文均可）或零件号以 Q/X 开头时，
@@ -324,13 +329,92 @@ def set_mass_value(sheet, row: int, column: str, value: Any) -> None:
     cell.number_format = "0.00"
 
 
+def crop_to_square(image_bytes: bytes) -> BytesIO:
+    """按 CATIA 的近似纯色背景定位全部可见零件，再补成正方形。"""
+    with Image.open(BytesIO(image_bytes)) as source:
+        original = source.convert("RGB")
+    width, height = original.size
+    preview = original.copy()
+    preview.thumbnail((800, 800))
+    pw, ph = preview.size
+    pixels = preview.load()
+    samples = [
+        pixels[int(pw * x), int(ph * y)]
+        for x, y in ((0.04, 0.5), (0.96, 0.5), (0.5, 0.04), (0.5, 0.96))
+    ]
+    background = tuple(sorted(sample[channel] for sample in samples)[2] for channel in range(3))
+    consistent = sum(
+        max(abs(color[c] - background[c]) for c in range(3)) < 35
+        for color in samples
+    ) >= 3
+    bounds = None
+    has_tree = False
+    if consistent:
+        # 旧版 CATIA 截图可能带左侧产品树：左边缘多行持续有图标/文字。
+        tree_rows = sum(
+            any(max(abs(pixels[x, y][c] - background[c]) for c in range(3)) > 45
+                for x in range(0, max(1, int(pw * 0.06)), 3))
+            for y in range(0, ph, 3)
+        )
+        has_tree = 0.12 * (ph / 3) < tree_rows < 0.80 * (ph / 3)
+        xmin, ymin, xmax, ymax = pw, ph, -1, -1
+        background_pixels = 0
+        for y in range(ph):
+            for x in range(pw):
+                color = pixels[x, y]
+                difference = max(abs(color[c] - background[c]) for c in range(3))
+                if difference <= 45:
+                    background_pixels += 1
+                    continue
+                if has_tree and x < 0.30 * pw:
+                    continue
+                # CATIA 的方向罗盘与坐标轴位于视窗右侧的两个角落。
+                if (x >= 0.84 * pw and y <= 0.18 * ph) or (x >= 0.90 * pw and y >= 0.86 * ph):
+                    continue
+                xmin, ymin = min(xmin, x), min(ymin, y)
+                xmax, ymax = max(xmax, x), max(ymax, y)
+        if (background_pixels >= 0.45 * pw * ph and
+                xmax >= xmin and ymax >= ymin and
+                xmax - xmin >= 0.02 * pw and ymax - ymin >= 0.02 * ph):
+            bounds = (
+                math.floor(xmin * width / pw), math.floor(ymin * height / ph),
+                math.ceil((xmax + 1) * width / pw), math.ceil((ymax + 1) * height / ph),
+            )
+
+    if bounds is None:
+        bounds = (0, 0, width, height)
+    if has_tree:
+        # 裁切框可能为补足正方形而向左扩展，需同时抹掉残余产品树。
+        ImageDraw.Draw(original).rectangle((0, 0, int(width * 0.30), height), fill=background)
+    left, top, right, bottom = bounds
+    box_width, box_height = right - left, bottom - top
+    side = max(1, math.ceil(max(box_width, box_height) * (1 + 2 * IMAGE_MARGIN)))
+    center_x, center_y = (left + right) / 2, (top + bottom) / 2
+    square_left = math.floor(center_x - side / 2)
+    square_top = math.floor(center_y - side / 2)
+    square = Image.new("RGB", (side, side), background)
+    crop_box = (max(0, square_left), max(0, square_top),
+                min(width, square_left + side), min(height, square_top + side))
+    if crop_box[2] > crop_box[0] and crop_box[3] > crop_box[1]:
+        square.paste(original.crop(crop_box),
+                     (crop_box[0] - square_left, crop_box[1] - square_top))
+    result = BytesIO()
+    square.save(result, format="PNG")
+    result.seek(0)
+    return result
+
+
 def copy_thumbnail(sheet, source_image: ExcelImage | None, target_cell: str) -> None:
     if source_image is None:
         return
-    image_bytes = source_image._data()
-    target_image = ExcelImage(BytesIO(image_bytes))
-    target_image.width = 160
-    target_image.height = 77
+    target_image = ExcelImage(crop_to_square(source_image._data()))
+    target_image.width = TEMPLATE_IMAGE_PX
+    target_image.height = TEMPLATE_IMAGE_PX
+    # AN 为 6 行合并单元格；让 8.57 cm 的图片完整落在该单元格内。
+    sheet.column_dimensions["AN"].width = max(sheet.column_dimensions["AN"].width or 0, 47)
+    start_row = sheet[target_cell].row
+    for row in range(start_row, start_row + ROWS_PER_RECORD):
+        sheet.row_dimensions[row].height = max(sheet.row_dimensions[row].height or 0, 41)
     sheet.add_image(target_image, target_cell)
 
 
@@ -339,6 +423,7 @@ def write_record(
     target_row: int,
     record: dict[str, Any],
     source_image: ExcelImage | None,
+    geely_mode: bool = False,
 ) -> None:
     path = record["_path"]
     depth = len(path) - 1
@@ -348,6 +433,9 @@ def write_record(
         )
 
     part_no = clean_text(record.get("零件号"))
+    part_name = trim_part_name(record.get("零件名称"))
+    # 吉利原表的名称在导出时已去掉 / 后的版本；转换旧表时也做一次兼容。
+    identifier = (part_name or "").partition("/")[0].strip() if geely_mode else part_no
     material = clean_text(record.get("PartBody Material")) or clean_text(record.get("属性 Material"))
     thickness = extract_thickness(record.get("名义厚度"))
     piece_mass = get_value(record, "单件质量(kg)")
@@ -358,13 +446,14 @@ def write_record(
 
     # 总成、分总成、零件号三列互斥，避免在同一条记录重复填写编号。
     if is_root_assembly(record):
-        set_value(sheet, target_row, "M", part_no)
+        set_value(sheet, target_row, "M", identifier)
     elif is_subassembly(record):
-        set_value(sheet, target_row, "N", part_no)
+        set_value(sheet, target_row, "N", identifier)
     elif is_part(record):
-        set_value(sheet, target_row, "O", part_no)
+        set_value(sheet, target_row, "O", identifier)
 
-    set_value(sheet, target_row, "Q", trim_part_name(record.get("零件名称")))
+    if not geely_mode:
+        set_value(sheet, target_row, "Q", part_name)
     if is_part(record):
         # 完整图片清单中的“本级数量”就是零件单耗；缺失时按 1 件处理。
         set_value(sheet, target_row, "R", get_value(record, "本级数量") or 1)
@@ -520,6 +609,7 @@ def convert_many(
     output_path: Path,
     progress_callback: Optional[Callable[[int, str], None]] = None,
     cancel_requested: Optional[Callable[[], bool]] = None,
+    geely_mode: bool = False,
 ) -> None:
     """将一份或多份 CATIA BOM 合并写入同一份基础数据管制表模板。"""
     normalized_bom_paths = [Path(path).resolve() for path in bom_paths]
@@ -562,6 +652,7 @@ def convert_many(
             target_row,
             record,
             record.get("_source_image"),
+            geely_mode=geely_mode,
         )
         _emit_progress(
             progress_callback,

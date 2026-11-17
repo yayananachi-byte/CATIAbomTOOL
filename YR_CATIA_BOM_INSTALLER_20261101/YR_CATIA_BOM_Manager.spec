@@ -14,6 +14,8 @@ hidden_imports = [
     "catia_bom_export_v2",
     "gwm_properties",
     "geely_data",
+    # 模板转换器作为数据文件动态加载，PyInstaller 不会自动分析其新增依赖。
+    "PIL.ImageDraw",
     "pythoncom",
     "pywintypes",
     "win32com.client",
