@@ -2,6 +2,12 @@
 
 这是基于现有 CATIA BOM 导出、截图和基础数据管制表转换脚本的 Windows GUI 第一版。
 
+## 版权与使用说明
+
+Copyright © 2026 朱煜锐。保留所有权利。
+
+本软件仅授权个人、非商业学习、评估和私下实验使用。未经书面许可，不得用于商业经营、商业产品、付费服务、销售、再发布、上传分享或分发。公开仓库的 GitHub 查看和 Fork 功能不构成前述商业使用或再发布授权。完整条款见仓库根目录的 [LICENSE.md](../LICENSE.md)。
+
 ## 启动
 
 首次使用请双击 `SETUP_GUI_RUNTIME.cmd`。它会使用系统安装的标准 CPython 3.10+ 创建本软件专用的 `.venv` 环境，并安装 `pywin32`、`openpyxl`、`Pillow`。不要用 `C:\Espressif\tools\python` 这类 ESP-IDF 专用 Python 运行本软件。
